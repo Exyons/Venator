@@ -194,10 +194,60 @@ While an animation is running, the keyboard's Fn brightness up/down keys
 dim/brighten it live (the MCU ignores those keys in per-key mode, so the
 animator watches for them and adjusts brightness itself).
 
-Write your own animation (`render(t, num_cells, keymap) -> bytes`) or
-design and drop it in `~/.config/venator/{animations,designs}/`.
-See [`cli/animations/README.md`](cli/animations/README.md) and
-[`cli/designs/README.md`](cli/designs/README.md).
+#### Write your own designs & animations
+
+Drop a file into your config dir and it is picked up automatically:
+
+- designs → `~/.config/venator/designs/` (`.py` or `.json`)
+- animations → `~/.config/venator/animations/` (`.py`)
+
+They then appear under `venator rgb design --list` / `venator rgb animate
+--list`. In the **TUI** they show up as buttons on the Keyboard tab's
+*Designs* / *Animations* sub‑tabs; press **Refresh** (or `Ctrl‑R`) to
+rescan after adding a file. A user file that shares a name with a shipped
+one wins.
+
+Both use one contract: a `render(t, num_cells, keymap)` that returns
+`num_cells * 3` bytes, one R,G,B triplet per cell (128 cells on the
+PH16‑71). A **design** is rendered once with `t = 0`; an **animation** is
+rendered `FPS` times a second with `t` = seconds elapsed.
+
+A design, `~/.config/venator/designs/split.py` (left half red, right blue):
+
+```python
+NAME = "split"
+DESCRIPTION = "left half red, right half blue"
+
+def render(t, num_cells, keymap):
+    buf = bytearray(num_cells * 3)
+    for i in range(num_cells):
+        r, g, b = (255, 0, 0) if i < num_cells // 2 else (0, 0, 255)
+        buf[i*3 : i*3+3] = bytes((r, g, b))
+    return bytes(buf)
+```
+
+Apply it: `venator rgb design split` (or click it in the TUI).
+
+An animation, `~/.config/venator/animations/pulse.py` (whole board breathes):
+
+```python
+import math
+
+NAME = "pulse"
+DESCRIPTION = "whole keyboard breathes magenta"
+FPS = 30
+
+def render(t, num_cells, keymap):
+    level = (math.sin(t * math.pi) + 1) / 2          # 0..1, ~0.5 Hz
+    r, g, b = int(255 * level), 0, int(120 * level)
+    return bytes((r, g, b)) * num_cells
+```
+
+Run it: `venator rgb animate pulse` (`Ctrl‑C` to stop). To light specific
+physical keys, read `keymap["keys"].get("W")` for a cell index; that needs
+a keymap (`venator map discover`). Full reference:
+[`cli/designs/README.md`](cli/designs/README.md) and
+[`cli/animations/README.md`](cli/animations/README.md).
 
 ### Rear lightbar
 
