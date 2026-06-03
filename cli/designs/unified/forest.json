@@ -1,0 +1,15 @@
+{
+  "name": "forest",
+  "description": "solid green on keyboard, green breathing on lightbar",
+  "keyboard": {
+    "mode": "static",
+    "color": "#2db44a",
+    "brightness": 180
+  },
+  "lightbar": {
+    "mode": "breathing",
+    "color": "#2db44a",
+    "brightness": 180,
+    "speed": 4
+  }
+}

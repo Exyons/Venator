@@ -1,0 +1,20 @@
+{
+  "name": "Coding",
+  "description": "Subtle dim base; function keys orange; bracket / symbol keys teal; Esc accent red; Enter green. Useful for editors with chord-heavy keybindings.",
+  "base_color": "#0a0a14",
+  "keys": {
+    "F1":  "#ff8800", "F2":  "#ff8800", "F3":  "#ff8800", "F4":  "#ff8800",
+    "F5":  "#ff8800", "F6":  "#ff8800", "F7":  "#ff8800", "F8":  "#ff8800",
+    "F9":  "#ff8800", "F10": "#ff8800", "F11": "#ff8800", "F12": "#ff8800",
+    "Esc":   "#ff2244",
+    "Tab":   "#ffcc44",
+    "Enter": "#66ff66",
+    "[":     "#00cccc",
+    "]":     "#00cccc",
+    "\\":    "#00cccc",
+    "'":     "#00cccc",
+    ";":     "#00cccc",
+    "/":     "#00cccc",
+    "`":     "#00cccc"
+  }
+}

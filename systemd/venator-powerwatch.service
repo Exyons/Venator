@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Watch the AC adapter and re-apply the per-source power profile in real
+# time whenever the charger is plugged in or unplugged. Without this the
+# AC/battery policy is only applied at login (by the restore service);
+# this daemon keeps it correct as you move around.
+#
+# Installed by `make install` to /etc/systemd/user/, enabled per-user:
+#
+#     systemctl --user enable --now venator-powerwatch
+#
+# It's a user service for the same reason restore is: the AC/battery
+# policy lives in the user's ~/.config/venator/power-policy.json.
+# Writing /sys/firmware/acpi/platform_profile needs the `predator` group
+# (granted by venator-perms.service), which the user has.
+
+[Unit]
+Description=Predator-sense AC/battery power-profile watcher
+ConditionPathExists=/sys/firmware/acpi/platform_profile
+After=graphical-session-pre.target venator-restore.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/venator power-watch
+# It polls a sysfs file every couple of seconds; if it ever crashes,
+# bring it back so plug/unplug keeps working.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+{
+  "name": "off",
+  "description": "fully dark — keyboard LEDs and lightbar both off",
+  "keyboard": {
+    "mode": "off",
+    "color": "#000000",
+    "brightness": 0
+  },
+  "lightbar": {
+    "mode": "off",
+    "color": "#000000",
+    "brightness": 0,
+    "speed": 0
+  }
+}

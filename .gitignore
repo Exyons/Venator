@@ -1,0 +1,41 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+*.symvers
+*.order
+.tmp_versions/
+modules.order
+Module.symvers
+
+# DKMS / Kbuild
+.*.cmd
+*.markers
+
+# Diagnostics output (machine-specific, not committed)
+diagnostics/
+*.dat
+*.aml
+*.dsl
+*.bin
+
+# Vendor blobs (PredatorSense binaries — never commit)
+vendor/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Python (CLI may grow tooling)
+__pycache__/
+*.pyc
+.venv/
+
+# Build outputs
+build/
+dist/

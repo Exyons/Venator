@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Hand /sys entries used by `venator power` / `venator
+# battery limit` to the `predator` group, so the CLI doesn't need sudo.
+#
+# Why a oneshot service instead of a udev rule:
+#   - /sys/firmware/acpi/platform_profile is created by the kernel
+#     ACPI subsystem at boot. It doesn't fire a udev `add` event we
+#     can hook on reliably.
+#   - The battery threshold file appears later, when acer_wmi_battery
+#     binds. By waiting until multi-user.target we're past both.
+#   - Re-running this after suspend/resume isn't necessary; the perms
+#     persist as long as the inode does, and the inode persists.
+#
+# Installed by `make install` to /etc/systemd/system/. Enabled with:
+#     systemctl enable --now venator-perms.service
+
+[Unit]
+Description=Predator-sense power-management sysfs permissions
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Best-effort: each entry is independently optional. acer_wmi_battery
+# may not be loaded; the chgrp/chmod just no-ops if the target is missing.
+ExecStart=/bin/sh -c '\
+  set +e; \
+  for f in /sys/firmware/acpi/platform_profile \
+           /sys/class/power_supply/BAT*/charge_control_start_threshold \
+           /sys/class/power_supply/BAT*/charge_control_end_threshold \
+           /sys/class/power_supply/BAT*/charge_behaviour \
+           /sys/class/predator/battery0/health_mode \
+           /sys/class/predator/battery0/calibration_mode \
+           /sys/class/predator/battery0/charge_control_end_threshold; do \
+    [ -e "$f" ] || continue; \
+    chgrp predator "$f" 2>/dev/null && chmod g+w "$f" 2>/dev/null; \
+  done; \
+  exit 0'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Restore the venator "default" profile when the user session
+# starts. Installed by `make install` to /etc/systemd/user/, enabled
+# per-user with:
+#
+#     systemctl --user enable --now venator-restore
+#
+# The "default" profile is auto-saved on every `venator rgb ...`
+# command -- whatever was last applied (static, design, perkey, OR a
+# running animation) gets snapshotted. profile load resumes it,
+# including respawning the detached animator if applicable.
+#
+# Why a user service: each user's profile JSON lives in their own
+# ~/.config/venator/profiles/. A system-wide alternative would
+# bake colours into ExecStart (e.g. `venator rgb static
+# '#ff0000'`) and live under /etc/systemd/system/.
+
+[Unit]
+Description=Restore venator RGB profile
+ConditionPathIsDirectory=/sys/class/predator
+After=graphical-session-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/venator profile load default
+# Don't fail the unit if the user hasn't saved a default profile yet.
+SuccessExitStatus=1
+RemainAfterExit=no
+# When `profile load` resumes an animation, it spawns a detached
+# background process via start_new_session. KillMode=process tells
+# systemd to only kill the ExecStart pid when this oneshot exits, not
+# the whole cgroup -- so our detached animator child survives.
+KillMode=process
+
+[Install]
+WantedBy=default.target

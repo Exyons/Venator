@@ -1,0 +1,15 @@
+{
+  "name": "ocean",
+  "description": "calming blue breathing across keyboard and lightbar",
+  "keyboard": {
+    "mode": "breathing",
+    "color": "#0078d4",
+    "brightness": 180
+  },
+  "lightbar": {
+    "mode": "breathing",
+    "color": "#0078d4",
+    "brightness": 180,
+    "speed": 5
+  }
+}

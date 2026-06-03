@@ -1,0 +1,25 @@
+{
+  "name": "FPS Gaming",
+  "description": "WASD glow orange; modifiers + space deep orange; weapon keys Q/E/R/F cyan; 1-5 green; Tab/Esc accent pink. Requires keymap entries for those names; missing ones are skipped (the cli prints a note).",
+  "base_color": "#000000",
+  "keys": {
+    "W":      "#ff6600",
+    "A":      "#ff6600",
+    "S":      "#ff6600",
+    "D":      "#ff6600",
+    "LShift": "#ff3300",
+    "Space":  "#ff3300",
+    "LCtrl":  "#ff3300",
+    "Q":      "#00aaff",
+    "E":      "#00aaff",
+    "R":      "#00aaff",
+    "F":      "#00aaff",
+    "1":      "#22ff44",
+    "2":      "#22ff44",
+    "3":      "#22ff44",
+    "4":      "#22ff44",
+    "5":      "#22ff44",
+    "Tab":    "#ff0066",
+    "Esc":    "#ff0066"
+  }
+}

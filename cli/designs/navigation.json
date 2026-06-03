@@ -1,0 +1,17 @@
+{
+  "name": "Navigation",
+  "description": "Dim warm-white base with cool blue accents on every navigation cluster: arrows, PgUp/PgDn, Home/End, Ins/Del. Good for office / writing.",
+  "base_color": "#332010",
+  "keys": {
+    "Up":    "#3388ff",
+    "Down":  "#3388ff",
+    "Left":  "#3388ff",
+    "Right": "#3388ff",
+    "PgUp":  "#3388ff",
+    "PgDn":  "#3388ff",
+    "Home":  "#3388ff",
+    "End":   "#3388ff",
+    "Ins":   "#3388ff",
+    "Del":   "#3388ff"
+  }
+}

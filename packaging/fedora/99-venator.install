@@ -1,0 +1,111 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# kernel-install hook for the venator out-of-tree module.
+#
+# Lives at /etc/kernel/install.d/99-venator.install. Fedora's
+# kernel-install machinery invokes every executable in this directory
+# on `kernel-install add KVER` (which RPM runs on every new kernel
+# package install) and `kernel-install remove KVER`. So this script
+# does what akmods used to do, but with zero indirection:
+#
+#   * source tree lives at /usr/src/venator/
+#   * build → sign → install → depmod, all in this script
+#   * runs once per new kernel — no daemon, no RPM dependency
+#
+# Logs go to journald under the tag `venator-hook`. To inspect
+# after a kernel upgrade:
+#
+#     journalctl -t venator-hook -b
+#
+# Exit codes: always 0. We must not block kernel-install; if the build
+# fails (e.g. headers not installed yet), log the error and exit
+# cleanly so the kernel package install succeeds.
+
+set -u
+
+COMMAND="${1:-}"
+KVER="${2:-}"
+
+SRC_DIR=/usr/src/venator
+KEY_DIR=/etc/pki/akmods
+LOG_TAG=venator-hook
+
+log()  { logger -t "$LOG_TAG" -- "$*"; printf 'venator: %s\n' "$*" >&2; }
+warn() { log "WARNING: $*"; }
+fail() { log "ERROR: $*"; exit 0; }   # NB: exit 0 — never block kernel-install.
+
+[ -n "$COMMAND" ] || fail "no command argument (called outside kernel-install?)"
+[ -n "$KVER" ]    || fail "no kernel version argument"
+
+case "$COMMAND" in
+  add)
+    [ -d "$SRC_DIR" ] || fail "no source tree at $SRC_DIR (was the hook installed correctly?)"
+    [ -d "/lib/modules/$KVER/build" ] || \
+        fail "no kernel build dir at /lib/modules/$KVER/build (headers not installed?)"
+
+    log "building venator.ko for kernel $KVER"
+
+    # Stage the sources so we don't pollute SRC_DIR with build artefacts.
+    STAGING=$(mktemp -d /tmp/venator-build.XXXXXX) \
+        || fail "couldn't create staging dir"
+    trap 'rm -rf "$STAGING"' EXIT
+
+    cp -a "$SRC_DIR"/. "$STAGING"/ || fail "cp source tree failed"
+
+    if ! make -C "/lib/modules/$KVER/build" M="$STAGING" modules >/dev/null 2>&1; then
+        # Re-run with output so the error lands in the journal.
+        make -C "/lib/modules/$KVER/build" M="$STAGING" modules 2>&1 \
+            | logger -t "$LOG_TAG" --
+        fail "make modules failed for $KVER"
+    fi
+
+    KO="$STAGING/venator.ko"
+    [ -f "$KO" ] || fail "build succeeded but no $KO produced"
+
+    # Sign for Secure Boot using the akmods key (which the user already
+    # has enrolled in MOK from a previous install or from akmods-keygen).
+    if [ -d "$KEY_DIR/private" ] && [ -d "$KEY_DIR/certs" ]; then
+        KEY=$(find "$KEY_DIR/private" -maxdepth 1 -type f -name '*.priv' 2>/dev/null | head -1)
+        CERT=$(find "$KEY_DIR/certs" -maxdepth 1 -type f \
+                \( -name '*.der' -o -name '*.cer' -o -name '*.crt' \) 2>/dev/null | head -1)
+        if [ -n "$KEY" ] && [ -n "$CERT" ]; then
+            if /lib/modules/$KVER/build/scripts/sign-file sha256 \
+                   "$KEY" "$CERT" "$KO" 2>&1 | logger -t "$LOG_TAG" --; then
+                log "signed venator.ko with $KEY"
+            else
+                warn "sign-file failed; module may be rejected under Secure Boot"
+            fi
+        else
+            warn "no akmods key found in $KEY_DIR; module will fail to load under Secure Boot"
+        fi
+    else
+        warn "$KEY_DIR not present; module not signed"
+    fi
+
+    # Wipe any orphan .ko in updates/ (modprobe searches updates/ before
+    # extra/, so a stale `make -C kernel install` leftover would shadow
+    # what we just built).
+    rm -f "/lib/modules/$KVER/updates/venator.ko" 2>/dev/null
+
+    # Install + depmod.
+    install -Dm644 "$KO" "/lib/modules/$KVER/extra/venator/venator.ko" \
+        || fail "install to /lib/modules/$KVER/extra/ failed"
+    depmod -a "$KVER" 2>&1 | logger -t "$LOG_TAG" --
+    log "installed venator.ko to /lib/modules/$KVER/extra/venator/"
+    ;;
+
+  remove)
+    if [ -e "/lib/modules/$KVER/extra/venator" ]; then
+        rm -rf "/lib/modules/$KVER/extra/venator"
+        log "removed venator.ko from $KVER"
+    fi
+    ;;
+
+  *)
+    # 'add'/'remove' are the only ones we handle. Other commands
+    # (none currently defined by kernel-install) are silently ignored.
+    ;;
+esac
+
+exit 0

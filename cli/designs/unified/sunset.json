@@ -1,0 +1,15 @@
+{
+  "name": "sunset",
+  "description": "warm orange breathing across both",
+  "keyboard": {
+    "mode": "breathing",
+    "color": "#ff6a00",
+    "brightness": 200
+  },
+  "lightbar": {
+    "mode": "breathing",
+    "color": "#ff6a00",
+    "brightness": 200,
+    "speed": 6
+  }
+}

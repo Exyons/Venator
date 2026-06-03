@@ -1,0 +1,3686 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""
+venator -- userspace CLI for the venator kernel module.
+
+Talks to /sys/class/predator/keyboard<N>/ exclusively. See docs/sysfs.md
+for the ABI.
+
+Most subcommands stage state and then `apply`, so a single high-level
+call (e.g. `venator rgb static '#ff0000'`) results in one
+hardware transaction. The lower-level `mode`, `color`, `brightness`,
+`effect-id` subcommands only stage -- run `venator apply` when
+you're done tweaking, or use `--apply` on the last one.
+
+Writing /sys requires either root or membership in the `predator`
+group (udev rule -- see Phase 4).
+"""
+from __future__ import annotations
+
+import argparse
+import binascii
+import glob
+import datetime
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Iterable
+
+SYSFS_ROOT = Path("/sys/class/predator")
+
+
+def _real_home() -> Path:
+    """Return the invoking user's home dir even when we've been re-exec'd
+    as root via sudo. Without this, KEYMAP and profile JSON end up in
+    /root/.config/venator and the user can't access them once they
+    drop privileges.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and os.geteuid() == 0:
+        try:
+            import pwd
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except (KeyError, ImportError):
+            pass
+    return Path(os.path.expanduser("~"))
+
+
+def _chown_to_invoker(path: Path) -> None:
+    """If running as root via sudo, hand ownership of `path` to the
+    invoking user. No-op for pure root or non-root.
+    """
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user or os.geteuid() != 0:
+        return
+    try:
+        import pwd
+        pw = pwd.getpwnam(sudo_user)
+        os.chown(str(path), pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError, ImportError):
+        pass
+
+
+PROFILE_DIR = _real_home() / ".config" / "venator" / "profiles"
+RUNTIME_DIR = _real_home() / ".cache" / "venator"
+BG_PID_FILE = RUNTIME_DIR / "background.pid"
+DEFAULT_PROFILE_NAME = "default"
+KEEPALIVE_INTERVAL_S = 30.0
+SCRIPT_PATH = str(Path(__file__).resolve())
+
+# --timeout default. 0 = no auto-limit (the natural behaviour for both
+# static and animation modes). Capped at 60 per the user-facing contract.
+# When >0 the worker exits after that many seconds. The exit semantics
+# differ between static and animation -- see _loop_keepalive and
+# _loop_animation.
+DEFAULT_TIMEOUT_S = 0
+TIMEOUT_MAX_S     = 60
+
+
+def parse_timeout(v) -> int:
+    try:
+        t = int(v)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"timeout must be an integer 0..{TIMEOUT_MAX_S}")
+    if not (0 <= t <= TIMEOUT_MAX_S):
+        raise argparse.ArgumentTypeError(f"timeout must be 0..{TIMEOUT_MAX_S} seconds")
+    return t
+
+
+def _add_timeout_arg(parser, default=DEFAULT_TIMEOUT_S):
+    parser.add_argument(
+        "--timeout", type=parse_timeout, default=default,
+        help=(f"override how long the LEDs stay lit, in seconds (0..{TIMEOUT_MAX_S}). "
+              f"Default 0 means 'no override' -- static modes use the EC's natural "
+              f"idle (dim after ~60s, wake on keypress); animations run forever. "
+              f"For static modes, a positive value runs a keepalive for N seconds "
+              f"then hands off to the EC. For animations, a positive value stops "
+              f"the animation at N seconds and turns the LEDs off cleanly (no "
+              f"wake-on-keypress, since you explicitly asked for shutoff)."),
+    )
+
+# Modes supported by the kernel (kept in sync with venator.h).
+MODES = ("off", "static", "breathing", "rainbow", "snake", "ripple",
+         "neon", "rain", "explosion", "pulse", "stars", "meteor",
+         "aura", "perkey")
+
+# Modes that use the `color` attribute. Mirrors docs/sysfs.md.
+COLOUR_MODES = {"static", "breathing", "snake", "ripple", "rain",
+                "explosion", "pulse", "stars", "meteor", "aura"}
+
+# Bytes the kernel's `frame` attribute expects: 128 cells x 3 bytes RGB.
+PERKEY_BYTES = 128 * 3
+
+
+# --------------------------------------------------------------- helpers
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"venator: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_device() -> Path:
+    """Locate the keyboard sysfs device under /sys/class/predator/.
+
+    Phase 6 added a sibling `battery0` device under the same class.
+    A plain "first directory" pick will now sometimes return the
+    battery device and then every rgb command dies looking for
+    /sys/class/predator/battery0/mode. Filter for keyboard* (which
+    is the only name the HID driver in venator-main.c
+    creates), with a sanity check that the picked entry has the
+    expected LED attributes.
+    """
+    if not SYSFS_ROOT.exists():
+        die(f"{SYSFS_ROOT} not found -- is the venator module loaded?")
+    kbds = sorted(p for p in SYSFS_ROOT.iterdir()
+                  if p.is_dir() and p.name.startswith("keyboard"))
+    if not kbds:
+        # Fall back to "any dir with a `mode` attr" so we keep working
+        # if a future revision renames the device class.
+        for p in sorted(SYSFS_ROOT.iterdir()):
+            if p.is_dir() and (p / "mode").exists():
+                return p
+        die(f"no keyboard device under {SYSFS_ROOT}")
+    return kbds[0]
+
+
+def write_text_attr(dev: Path, attr: str, value: str) -> None:
+    path = dev / attr
+    if not path.exists():
+        die(f"{path} not found")
+    try:
+        path.write_text(value)
+    except PermissionError:
+        die(f"permission denied writing {path}.\n"
+            f"  Run with sudo, or add yourself to the 'predator' group "
+            f"once the udev rule is installed.")
+    except OSError as e:
+        die(f"write to {path} failed: {e}")
+
+
+def write_bin_attr(dev: Path, attr: str, data: bytes) -> None:
+    path = dev / attr
+    if not path.exists():
+        die(f"{path} not found")
+    try:
+        with path.open("wb") as f:
+            f.write(data)
+    except PermissionError:
+        die(f"permission denied writing {path}")
+    except OSError as e:
+        die(f"write to {path} failed: {e}")
+
+
+def read_text_attr(dev: Path, attr: str, default: str = "") -> str:
+    path = dev / attr
+    if not path.exists():
+        return default
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return default
+
+
+def parse_rgb(s: str) -> tuple[int, int, int]:
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", s)
+    if not m:
+        die(f"invalid colour {s!r} -- expected #RRGGBB")
+    h = m.group(1)
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def rgb_hex(r: int, g: int, b: int) -> str:
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def commit(dev: Path) -> None:
+    write_text_attr(dev, "apply", "1")
+
+
+# --------------------------------------------------------------- frame helpers
+
+def frame_from_solid(r: int, g: int, b: int) -> bytes:
+    return bytes([r, g, b]) * 128
+
+
+def frame_from_hex(h: str) -> bytes:
+    h = h.replace(" ", "").replace(":", "").replace("\n", "")
+    try:
+        data = binascii.unhexlify(h)
+    except binascii.Error as e:
+        die(f"bad hex: {e}")
+    if len(data) != PERKEY_BYTES:
+        die(f"hex decodes to {len(data)} bytes, need {PERKEY_BYTES}")
+    return data
+
+
+def frame_from_file(path: Path) -> bytes:
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        die(f"cannot read {path}: {e}")
+    if len(data) == PERKEY_BYTES:
+        return data
+    # Allow hex-encoded files too.
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        die(f"{path}: {len(data)} bytes raw, expected {PERKEY_BYTES} "
+            f"(or a hex-encoded text file)")
+    return frame_from_hex(text)
+
+
+def parse_frame_arg(arg: str) -> bytes:
+    # "@filename" -> read from file. Otherwise, treat as hex string.
+    if arg.startswith("@"):
+        return frame_from_file(Path(arg[1:]))
+    p = Path(arg)
+    if p.exists() and p.is_file():
+        return frame_from_file(p)
+    return frame_from_hex(arg)
+
+
+# --------------------------------------------------- background process
+
+def _ensure_runtime_dir() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    _chown_to_invoker(RUNTIME_DIR)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # exists, just owned by someone else
+        return True
+
+
+def stop_background() -> None:
+    """Kill the previously-spawned animation / keepalive process, if any.
+
+    Silently survives the case where the PID is dead or owned by another
+    user (e.g. user mixed sudo and non-sudo). On permission failure we
+    just clear the PID file and move on -- the orphan will exit when
+    its writes start failing, or the user can `pkill -f venator`.
+    """
+    if not BG_PID_FILE.exists():
+        return
+    try:
+        pid = int(BG_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        BG_PID_FILE.unlink(missing_ok=True)
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        # Wait briefly for it to exit.
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        pass  # owned by another user; user has to clean up manually
+    BG_PID_FILE.unlink(missing_ok=True)
+
+
+def _spawn_background(args: list[str]) -> int:
+    _ensure_runtime_dir()
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    BG_PID_FILE.write_text(str(proc.pid))
+    _chown_to_invoker(BG_PID_FILE)
+    return proc.pid
+
+
+def start_animator(name: str, brightness: int | None, timeout: int = 0) -> None:
+    stop_background()
+    args = [sys.executable, SCRIPT_PATH, "_run-loop", "--anim", name,
+            "--timeout", str(timeout)]
+    if brightness is not None:
+        args += ["--brightness", str(brightness)]
+    _spawn_background(args)
+
+
+def start_keepalive(timeout: int) -> None:
+    """Spawn the keepalive worker. With timeout > 0 it re-pokes `apply`
+    every KEEPALIVE_INTERVAL_S seconds for that many seconds and then
+    exits, leaving the EC to handle the natural idle-off + wake-on-
+    keypress. With timeout == 0 we don't spawn anything -- the user
+    asked for the natural EC behaviour without override, which means
+    just one initial apply (the high-level command already did that).
+    """
+    stop_background()
+    if timeout <= 0:
+        return
+    args = [sys.executable, SCRIPT_PATH, "_run-loop", "--keepalive",
+            "--timeout", str(timeout)]
+    _spawn_background(args)
+
+
+# --------------------------------------------------- auto-saved default profile
+
+# A "static" autosaved profile mirrors the current sysfs state and the
+# frame buffer; on restore we just write those back and apply. An
+# "animation" autosaved profile remembers the animation name so on
+# restore we respawn the animator.
+
+def _snapshot_lightbar() -> dict | None:
+    """Read the current kernel-cached lightbar state. Returns None if
+    the lightbar driver isn't bound (no /sys/class/predator/lightbar0).
+    """
+    if not PREDATOR_LIGHTBAR_DIR.exists():
+        return None
+    out: dict = {}
+    for attr in ("mode", "brightness", "speed", "direction", "color"):
+        p = PREDATOR_LIGHTBAR_DIR / attr
+        if p.exists():
+            try:
+                out[attr] = p.read_text().strip()
+            except OSError:
+                pass
+    return out or None
+
+
+def _autosave_lightbar() -> None:
+    """Mirror the lightbar half of save_default(): snapshot the
+    lightbar state into the `default` profile alongside the keyboard
+    state. Called on every CLI lightbar mutation.
+    """
+    snap_path = PROFILE_DIR / f"{DEFAULT_PROFILE_NAME}.json"
+    existing: dict = {}
+    if snap_path.exists():
+        try:
+            existing = json.loads(snap_path.read_text())
+        except (OSError, ValueError):
+            existing = {}
+    lb = _snapshot_lightbar()
+    if lb is None:
+        return
+    existing["lightbar"] = lb
+    existing.setdefault("_autosaved", True)
+    # Ensure dirs are owned by the invoking user (handles sudo).
+    parts: list[Path] = []
+    p = PROFILE_DIR
+    while not p.exists() and p != p.parent:
+        parts.append(p); p = p.parent
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    for created in reversed(parts):
+        _chown_to_invoker(created)
+    snap_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
+    _chown_to_invoker(snap_path)
+
+
+def save_default(dev: Path, *, animation_name: str | None = None,
+                 timeout: int = 0) -> None:
+    snap: dict[str, object] = {
+        "_autosaved": True,
+        "mode":       read_text_attr(dev, "mode"),
+        "color":      read_text_attr(dev, "color"),
+        "brightness": read_text_attr(dev, "brightness"),
+        "effect_id":  read_text_attr(dev, "effect_id"),
+        "timeout":    int(timeout),
+    }
+    if animation_name:
+        snap["animation_name"] = animation_name
+    # Capture the per-key frame too so designs/perkey paint restores 1:1.
+    try:
+        frame = (dev / "frame").read_bytes()
+        if len(frame) == PERKEY_BYTES:
+            snap["frame_hex"] = frame.hex()
+    except OSError:
+        pass
+    # Capture the lightbar state too so `profile load default` restores
+    # both halves in one go. Skipped silently if the lightbar driver
+    # isn't bound (different kernel build, module unloaded, etc.).
+    lb = _snapshot_lightbar()
+    if lb is not None:
+        snap["lightbar"] = lb
+
+    # Ensure dirs are owned by the invoking user (handles sudo).
+    parts: list[Path] = []
+    p = PROFILE_DIR
+    while not p.exists() and p != p.parent:
+        parts.append(p); p = p.parent
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    for created in reversed(parts):
+        _chown_to_invoker(created)
+    out = PROFILE_DIR / f"{DEFAULT_PROFILE_NAME}.json"
+    out.write_text(json.dumps(snap, indent=2, sort_keys=True))
+    _chown_to_invoker(out)
+
+
+# --------------------------------------------------------------- keymap
+
+KEYMAP_DEFAULT = _real_home() / ".config" / "venator" / "keymap.json"
+
+
+def _shipped_keymap() -> Path:
+    """The bundled PH16-71 keymap. `make install` copies this into the
+    user's config, but fall back to it directly so per-key painting by
+    name works out of the box even on a fresh checkout / partial install.
+    """
+    return _find_shipped_dir("keymaps") / "ph16-71.json"
+
+
+def load_keymap(path: Path | None = None) -> dict:
+    explicit = path is not None
+    path = path or KEYMAP_DEFAULT
+    # No user keymap yet: fall back to the shipped PH16-71 one (read-only)
+    # so `rgb key`/`rgb keys` work before the user runs `map discover`.
+    if not explicit and not path.exists():
+        shipped = _shipped_keymap()
+        if shipped.exists():
+            path = shipped
+    if not path.exists():
+        return {"model": "Predator PH16-71", "num_cells": 128, "keys": {}}
+    try:
+        m = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"bad keymap {path}: {e}")
+    m.setdefault("keys", {})
+    m.setdefault("num_cells", 128)
+    return m
+
+
+def save_keymap(m: dict, path: Path | None = None) -> Path:
+    path = path or KEYMAP_DEFAULT
+    # mkdir the leaf and every intermediate, chowning each to the real
+    # user if we're running under sudo (so they own the file afterwards).
+    parts = []
+    p = path.parent
+    while not p.exists() and p != p.parent:
+        parts.append(p); p = p.parent
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for created in reversed(parts):
+        _chown_to_invoker(created)
+    path.write_text(json.dumps(m, indent=2, sort_keys=True))
+    _chown_to_invoker(path)
+    return path
+
+
+def base_frame_from_state(dev: Path) -> bytearray:
+    """Return a 384-byte buffer reflecting the keyboard's current visual
+    state, suitable for layering per-key edits onto.
+
+    - mode=perkey: use the current frame attr.
+    - mode in COLOUR_MODES with a colour set: fill with that colour.
+    - else: all off.
+    """
+    mode = read_text_attr(dev, "mode")
+    if mode == "perkey":
+        try:
+            return bytearray((dev / "frame").read_bytes()[:PERKEY_BYTES])
+        except OSError:
+            return bytearray(PERKEY_BYTES)
+    if mode in COLOUR_MODES:
+        col = read_text_attr(dev, "color")
+        m_ = re.fullmatch(r"#?([0-9a-fA-F]{6})", col or "")
+        if m_:
+            h = m_.group(1)
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return bytearray([r, g, b] * 128)
+    return bytearray(PERKEY_BYTES)
+
+
+def apply_cell_edits(dev: Path, edits: list[tuple[int, int, int, int]],
+                     announce_basis: bool = True) -> None:
+    """edits = [(cell, r, g, b), ...]. Modifies the current visual state
+    and switches into perkey mode.
+    """
+    cur_mode = read_text_attr(dev, "mode")
+    if announce_basis and cur_mode not in ("perkey",) and cur_mode not in COLOUR_MODES:
+        print(f"note: current mode is {cur_mode!r} (no solid colour to inherit); "
+              f"per-key edit starts from an off keyboard.", file=sys.stderr)
+    frame = base_frame_from_state(dev)
+    for cell, r, g, b in edits:
+        if 0 <= cell < 128:
+            frame[cell * 3 + 0] = r
+            frame[cell * 3 + 1] = g
+            frame[cell * 3 + 2] = b
+    write_bin_attr(dev, "frame", bytes(frame))
+    write_text_attr(dev, "mode", "perkey")
+    commit(dev)
+
+
+# --------------------------------------------------------------- animations
+
+def _find_shipped_dir(name: str) -> Path:
+    """Where the shipped designs/animations live. Source-tree wins if we're
+    running from a checkout (cli/<name>/ next to this script); otherwise
+    fall back to /usr/share or /usr/local/share for installed copies.
+    """
+    here = Path(__file__).resolve().parent
+    if (here / name).exists():
+        return here / name
+    for sysdir in ("/usr/local/share/venator", "/usr/share/venator"):
+        p = Path(sysdir) / name
+        if p.exists():
+            return p
+    return here / name
+
+
+ANIM_SHIPPED_DIR = _find_shipped_dir("animations")
+ANIM_USER_DIR    = _real_home() / ".config" / "venator" / "animations"
+
+
+def list_animations() -> dict:
+    """Return {name: path}. Shipped animations first; user overrides shipped."""
+    out: dict[str, Path] = {}
+    for d in (ANIM_SHIPPED_DIR, ANIM_USER_DIR):
+        if not d.exists():
+            continue
+        for f in sorted(d.glob("*.py")):
+            if f.stem.startswith("_") or f.stem == "README":
+                continue
+            out[f.stem] = f
+    return out
+
+
+def find_animation(arg: str) -> Path:
+    p = Path(arg)
+    if p.suffix == ".py" and p.exists():
+        return p
+    anims = list_animations()
+    if arg in anims:
+        return anims[arg]
+    names = ", ".join(sorted(anims)) or "<none>"
+    die(f"animation {arg!r} not found. Available: {names}\n"
+        f"  Drop .py files in {ANIM_USER_DIR} to add your own.")
+
+
+def load_animation(path: Path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ps_anim", path)
+    if not spec or not spec.loader:
+        die(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        die(f"{path}: load failed: {e!r}")
+    if not hasattr(mod, "render") or not callable(mod.render):
+        die(f"{path}: missing render(t, num_cells, keymap) function")
+    return mod
+
+
+def cmd_rgb_animate(args: argparse.Namespace) -> None:
+    if args.list:
+        anims = list_animations()
+        if not anims:
+            print(f"  no animations installed")
+            print(f"  shipped: {ANIM_SHIPPED_DIR}")
+            print(f"  user:    {ANIM_USER_DIR}")
+            return
+        for name, path in sorted(anims.items()):
+            origin = "shipped" if path.parent == ANIM_SHIPPED_DIR else "user"
+            print(f"  {name:24s} [{origin}]  {path}")
+        return
+    if not args.name:
+        die("usage: venator rgb animate <name> | rgb animate --list")
+
+    # Resolve the animation now so we fail fast on a typo (the detached
+    # child won't have a terminal to complain at).
+    find_animation(args.name)
+
+    # Save default first so a crash in the spawn doesn't lose state.
+    dev = find_device()
+    write_text_attr(dev, "mode", "perkey")
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    save_default(dev, animation_name=args.name, timeout=args.timeout)
+
+    start_animator(args.name, args.brightness, args.timeout)
+    msg = f"animation '{args.name}' running in the background"
+    if args.timeout > 0:
+        msg += f" (auto-off in {args.timeout}s)"
+    print(msg + ". `rgb static` / `rgb off` / `rgb design ...` will stop it.")
+
+
+# Hidden "_run-loop" subcommand. Used internally by start_animator() and
+# start_keepalive() to run the actual loop in a detached child process.
+# Not for direct user invocation.
+
+def _turn_off(dev: Path) -> None:
+    """Active mode=off + apply.
+
+    The EC sees this as "active state at zero brightness" and won't fire
+    its built-in wake-on-keypress -- which is fine, because the background
+    workers reach this path only when they're going to start watching
+    /dev/input/event*-kbd themselves and reapply state on the next
+    keystroke.
+    """
+    try:
+        write_text_attr(dev, "mode", "off")
+        write_text_attr(dev, "apply", "1")
+    except SystemExit:
+        pass
+
+
+# ---- keyboard activity monitoring (evdev /dev/input/event*) ---------------
+#
+# The EC supports wake-on-keypress only for its own built-in effects. For
+# our custom designs / animations the mode=off state we set at the timeout
+# deadline puts the EC into "active zero-brightness", which suppresses its
+# wake. So we replicate the wake behaviour in userspace by reading
+# struct input_event from /dev/input/by-path/*-event-kbd ourselves.
+#
+# Requires the worker's UID to be in the `input` group (install.sh adds
+# the invoking user). When the worker can't open any event devices we
+# silently degrade to "no wake-on-keypress" instead of crashing.
+
+_INPUT_EVENT_SIZE = 24       # struct input_event on x86_64 (sec, usec, type, code, value)
+_EV_KEY = 1
+# Keyboard-backlight brightness keys (linux/input-event-codes.h). In
+# per-key / direct mode the keyboard MCU ignores its own Fn brightness
+# keys, so animations don't dim when you press them. We catch the key
+# events here and fold them into the brightness our per-frame apply
+# sends, which is what makes the keys work during an animation.
+_KEY_KBDILLUMDOWN = 229
+_KEY_KBDILLUMUP   = 230
+
+
+def _open_keyboard_event_devices() -> list[int]:
+    fds: list[int] = []
+    for path in glob.glob("/dev/input/by-path/*-event-kbd"):
+        try:
+            fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+        except OSError:
+            continue
+    return fds
+
+
+def _drain_kbd_events_ex(fds: list[int]) -> tuple[bool, int]:
+    """Read pending events from any fd. Returns (saw_press, bright_delta):
+
+      saw_press     True if at least one key PRESS (value=1) was seen —
+                    drives wake-on-keypress.
+      bright_delta  net brightness-key steps (+1 per KBDILLUMUP, -1 per
+                    KBDILLUMDOWN), counting press AND autorepeat so a
+                    held key keeps ramping.
+    """
+    if not fds:
+        return (False, 0)
+    try:
+        ready, _, _ = select.select(fds, [], [], 0)
+    except (OSError, ValueError):
+        return (False, 0)
+    saw = False
+    delta = 0
+    for fd in ready:
+        try:
+            data = os.read(fd, _INPUT_EVENT_SIZE * 64)
+        except (BlockingIOError, OSError):
+            continue
+        for i in range(0, len(data), _INPUT_EVENT_SIZE):
+            chunk = data[i:i + _INPUT_EVENT_SIZE]
+            if len(chunk) < _INPUT_EVENT_SIZE:
+                break
+            ev_type  = int.from_bytes(chunk[16:18], "little")
+            ev_code  = int.from_bytes(chunk[18:20], "little")
+            ev_value = int.from_bytes(chunk[20:24], "little", signed=True)
+            if ev_type != _EV_KEY:
+                continue
+            if ev_value == 1:
+                saw = True
+            if ev_value in (1, 2):   # press or autorepeat
+                if ev_code == _KEY_KBDILLUMUP:
+                    delta += 1
+                elif ev_code == _KEY_KBDILLUMDOWN:
+                    delta -= 1
+    return (saw, delta)
+
+
+def _drain_kbd_events(fds: list[int]) -> bool:
+    """Back-compat wrapper: True if any key PRESS was seen."""
+    return _drain_kbd_events_ex(fds)[0]
+
+
+def _close_fds(fds: list[int]) -> None:
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _restore_static_default(dev: Path) -> None:
+    """Re-apply the auto-saved 'default' profile's static fields. Called
+    by the keepalive worker when it sees a keypress after an idle-off.
+    """
+    profile_path = PROFILE_DIR / f"{DEFAULT_PROFILE_NAME}.json"
+    if not profile_path.exists():
+        return
+    try:
+        snap = json.loads(profile_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if snap.get("animation_name"):
+        return  # animation, not static; the animator worker handles its own resume
+    fhex = snap.get("frame_hex")
+    if fhex:
+        try:
+            write_bin_attr(dev, "frame", bytes.fromhex(fhex))
+        except (ValueError, SystemExit):
+            pass
+    for k in ("mode", "color", "brightness", "effect_id"):
+        v = snap.get(k)
+        if v:
+            try:
+                write_text_attr(dev, k, str(v))
+            except SystemExit:
+                pass
+    try:
+        write_text_attr(dev, "apply", "1")
+    except SystemExit:
+        pass
+
+
+def _loop_animation(name: str, brightness: int | None, timeout: int = 0) -> None:
+    """Render the animation in a background loop.
+
+    timeout == 0  (default):   render forever, no idle handling.
+    timeout >  0:              after `timeout` seconds with no keypress
+                               on any /dev/input/by-path/*-event-kbd,
+                               turn LEDs off (mode=off) AND pause rendering.
+                               When a key is pressed, restore mode=perkey,
+                               re-set brightness, and resume rendering at
+                               the time we paused (so the animation
+                               doesn't "skip ahead" silently).
+    """
+    mod = load_animation(find_animation(name))
+    fps = float(getattr(mod, "FPS", 30))
+    if fps < 1:
+        fps = 1
+    interval = 1.0 / fps
+    keymap = load_keymap()
+    dev = find_device()
+    write_text_attr(dev, "mode", "perkey")
+
+    # Brightness the per-frame apply sends. The MCU ignores its own Fn
+    # brightness keys in per-key mode, so we implement them: cur_bright
+    # starts from the requested value (or the live sysfs value) and the
+    # event loop below nudges it on KBDILLUMUP/DOWN. BRIGHT_STEP gives ~8
+    # levels across 0..255.
+    BRIGHT_STEP = 32
+    if brightness is not None:
+        cur_bright = brightness
+    else:
+        try:
+            cur_bright = int(read_text_attr(dev, "brightness"))
+        except (ValueError, TypeError):
+            cur_bright = 200
+    cur_bright = max(0, min(255, cur_bright))
+    write_text_attr(dev, "brightness", str(cur_bright))
+
+    # Always open the kbd event devices (not just for the idle timeout)
+    # so the brightness keys work even with timeout=0. Degrades silently
+    # to "no brightness keys" if we can't open them (no input group).
+    kbd_fds = _open_keyboard_event_devices()
+
+    elapsed       = 0.0                # animation-time accumulator (excludes paused durations)
+    last_tick     = time.monotonic()   # wall-clock at last frame
+    last_activity = time.monotonic()
+    paused        = False
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            saw_press, bright_delta = _drain_kbd_events_ex(kbd_fds)
+
+            # Fn brightness keys: fold into cur_bright and push to sysfs so
+            # the next frame's apply uses it. Works whether or not a
+            # timeout is set.
+            if bright_delta:
+                cur_bright = max(0, min(255, cur_bright + bright_delta * BRIGHT_STEP))
+                try:
+                    write_text_attr(dev, "brightness", str(cur_bright))
+                except SystemExit:
+                    pass
+
+            if kbd_fds and saw_press:
+                last_activity = now
+                if paused:
+                    # Wake: restore perkey mode + brightness, then resume rendering.
+                    paused = False
+                    try:
+                        write_text_attr(dev, "mode", "perkey")
+                        write_text_attr(dev, "brightness", str(cur_bright))
+                    except SystemExit:
+                        pass
+                    last_tick = now    # don't count the paused interval as animation time
+
+            if not paused and timeout > 0 and (now - last_activity) > timeout:
+                paused = True
+                _turn_off(dev)
+
+            if paused:
+                # Cheap poll loop while idle.
+                time.sleep(0.2)
+                continue
+
+            try:
+                frame = mod.render(elapsed, 128, keymap)
+            except Exception:
+                time.sleep(1.0)
+                continue
+            if not isinstance(frame, (bytes, bytearray)) or len(frame) != PERKEY_BYTES:
+                time.sleep(1.0)
+                continue
+            try:
+                write_bin_attr(dev, "frame", bytes(frame))
+                commit(dev)
+            except SystemExit:
+                # write_bin_attr / commit die() on EACCES etc. Don't bail
+                # the loop -- transient permission failures (e.g. mid-rebind)
+                # shouldn't kill the detached daemon.
+                time.sleep(1.0)
+                continue
+
+            elapsed += now - last_tick
+            last_tick = now
+
+            # Pace at ~FPS without busy-spinning.
+            sleep_for = interval - (time.monotonic() - now)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+    finally:
+        _close_fds(kbd_fds)
+
+
+def _loop_keepalive(timeout: int = 0) -> None:
+    """Idle-aware keepalive for static designs.
+
+    timeout == 0: not spawned (start_keepalive skips it).
+    timeout >  0: re-poke `apply` every KEEPALIVE_INTERVAL_S to override the
+                  EC's natural idle-dim while the user is active. After
+                  `timeout` seconds with no keypress on any
+                  /dev/input/by-path/*-event-kbd, mode=off + apply (LEDs
+                  go dark). When a key is pressed, re-apply the saved
+                  default profile (restores the design frame) and resume.
+                  Runs until killed.
+    """
+    if timeout <= 0:
+        return
+    dev = find_device()
+    kbd_fds = _open_keyboard_event_devices()
+
+    last_activity = time.monotonic()
+    last_apply    = time.monotonic()
+    leds_on       = True
+
+    try:
+        while True:
+            now = time.monotonic()
+
+            if kbd_fds and _drain_kbd_events(kbd_fds):
+                last_activity = now
+                if not leds_on:
+                    _restore_static_default(dev)
+                    leds_on = True
+                    last_apply = now
+
+            if leds_on and (now - last_activity) > timeout:
+                _turn_off(dev)
+                leds_on = False
+
+            if leds_on and (now - last_apply) >= KEEPALIVE_INTERVAL_S:
+                try:
+                    write_text_attr(dev, "apply", "1")
+                except SystemExit:
+                    pass
+                last_apply = now
+
+            time.sleep(0.3)
+    finally:
+        _close_fds(kbd_fds)
+
+
+def cmd__run_loop(args: argparse.Namespace) -> None:
+    # Run as a SESSION leader (start_new_session=True does this for us via
+    # the parent's Popen). Ignore SIGHUP so we survive terminal close.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    timeout = args.timeout if args.timeout is not None else 0
+    if args.anim:
+        _loop_animation(args.anim, args.brightness, timeout)
+    elif args.keepalive:
+        _loop_keepalive(timeout)
+    else:
+        die("_run-loop needs --anim NAME or --keepalive")
+
+
+def resolve_key_names(names: Iterable[str], keymap: dict) -> list[int]:
+    """Resolve a list of key names to cell indices. Exact match preferred,
+    case-insensitive match as fallback ('q' finds a key mapped as 'Q').
+    Dies if any are unknown.
+    """
+    keys = keymap.get("keys", {})
+    ci_index = {k.lower(): k for k in keys}
+    out, unknown = [], []
+    for n in names:
+        if n in keys:
+            out.append(int(keys[n]))
+        elif n.lower() in ci_index:
+            out.append(int(keys[ci_index[n.lower()]]))
+        else:
+            unknown.append(n)
+    if unknown:
+        die(f"unknown key{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}\n"
+            f"  Run `venator map discover` to teach the CLI which physical key\n"
+            f"  corresponds to each of the 128 cells. Run `venator map show`\n"
+            f"  to see what's mapped so far.")
+    return out
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_status(_: argparse.Namespace) -> None:
+    dev = find_device()
+    info = dev / "info"
+    print(f"device:           {dev}")
+    if info.exists():
+        for k in ("dev_vendor", "dev_product", "dev_name",
+                  "num_cells", "available_modes"):
+            v = read_text_attr(info, k)
+            if v:
+                print(f"  {k:18s} {v}")
+    print()
+    print("  control:")
+    for k in ("mode", "color", "brightness", "effect_id"):
+        v = read_text_attr(dev, k)
+        print(f"    {k:16s} {v}")
+
+
+def cmd_mode(args: argparse.Namespace) -> None:
+    if args.name not in MODES:
+        die(f"unknown mode {args.name!r}; one of: {' '.join(MODES)}")
+    write_text_attr(find_device(), "mode", args.name)
+    if args.apply:
+        commit(find_device())
+
+
+def cmd_color(args: argparse.Namespace) -> None:
+    parse_rgb(args.color)
+    write_text_attr(find_device(), "color", args.color)
+    if args.apply:
+        commit(find_device())
+
+
+def cmd_brightness(args: argparse.Namespace) -> None:
+    if not 0 <= args.value <= 255:
+        die("brightness must be 0..255")
+    write_text_attr(find_device(), "brightness", str(args.value))
+    if args.apply:
+        commit(find_device())
+
+
+def cmd_effect_id(args: argparse.Namespace) -> None:
+    if not 0 <= args.value <= 255:
+        die("effect-id must be 0..255")
+    write_text_attr(find_device(), "effect_id", str(args.value))
+    if args.apply:
+        commit(find_device())
+
+
+def cmd_apply(_: argparse.Namespace) -> None:
+    commit(find_device())
+
+
+def cmd_rgb_static(args: argparse.Namespace) -> None:
+    stop_background()
+    r, g, b = parse_rgb(args.color)
+    dev = find_device()
+    write_text_attr(dev, "mode", "static")
+    write_text_attr(dev, "color", rgb_hex(r, g, b))
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    commit(dev)
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+def cmd_rgb_effect(args: argparse.Namespace) -> None:
+    if args.name not in MODES or args.name in ("off", "static", "perkey"):
+        die(f"effect must be one of: "
+            f"{' '.join(m for m in MODES if m not in ('off', 'static', 'perkey'))}")
+    stop_background()
+    dev = find_device()
+    write_text_attr(dev, "mode", args.name)
+    if args.color is not None:
+        if args.name not in COLOUR_MODES:
+            print(f"note: {args.name!r} uses a hardcoded palette; "
+                  f"the colour you set won't be honoured.", file=sys.stderr)
+        parse_rgb(args.color)
+        write_text_attr(dev, "color", args.color)
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    commit(dev)
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+def cmd_rgb_off(_: argparse.Namespace) -> None:
+    stop_background()
+    dev = find_device()
+    write_text_attr(dev, "mode", "off")
+    commit(dev)
+    save_default(dev, timeout=0)
+    # Deliberately no keepalive when off.
+
+
+def cmd_rgb_fill(args: argparse.Namespace) -> None:
+    stop_background()
+    r, g, b = parse_rgb(args.color)
+    dev = find_device()
+    write_bin_attr(dev, "frame", frame_from_solid(r, g, b))
+    write_text_attr(dev, "mode", "perkey")
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    commit(dev)
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+def cmd_rgb_perkey(args: argparse.Namespace) -> None:
+    stop_background()
+    data = parse_frame_arg(args.data)
+    dev = find_device()
+    write_bin_attr(dev, "frame", data)
+    write_text_attr(dev, "mode", "perkey")
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    commit(dev)
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+def cmd_rgb_image(args: argparse.Namespace) -> None:
+    try:
+        from PIL import Image
+    except ImportError:
+        die("`venator rgb image` needs Pillow.\n"
+            "  Fedora:  sudo dnf install python3-pillow\n"
+            "  Ubuntu:  sudo apt install python3-pil\n"
+            "  Arch:    sudo pacman -S python-pillow")
+    try:
+        img = Image.open(args.path).convert("RGB")
+    except (FileNotFoundError, OSError) as e:
+        die(f"cannot open {args.path}: {e}")
+    # Scale to 128x1 -- one pixel per cell. The 128 cells don't map
+    # spatially to physical keys (yet -- that needs an extension to
+    # keymap.json), so the image renders as a 1D scan across the cell
+    # array. Once a spatial layout file exists, this becomes a 2D
+    # resize + per-cell pick.
+    img = img.resize((128, 1), Image.LANCZOS)
+    buf = bytearray()
+    for x in range(128):
+        r, g, b = img.getpixel((x, 0))
+        buf.extend([r, g, b])
+    stop_background()
+    dev = find_device()
+    write_bin_attr(dev, "frame", bytes(buf))
+    write_text_attr(dev, "mode", "perkey")
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    commit(dev)
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+# --------------------------------------------------------------- designs
+
+DESIGN_SHIPPED_DIR = _find_shipped_dir("designs")
+DESIGN_USER_DIR    = _real_home() / ".config" / "venator" / "designs"
+
+
+def list_designs() -> dict:
+    """Return {name: path}. Shipped first; user overrides shipped on conflict."""
+    out: dict[str, Path] = {}
+    for d in (DESIGN_SHIPPED_DIR, DESIGN_USER_DIR):
+        if not d.exists():
+            continue
+        for f in sorted(d.iterdir()):
+            if f.suffix not in (".py", ".json"):
+                continue
+            if f.stem.startswith("_") or f.stem == "README":
+                continue
+            out[f.stem] = f
+    return out
+
+
+def find_design(arg: str) -> Path:
+    p = Path(arg)
+    if p.suffix in (".py", ".json") and p.exists():
+        return p
+    designs = list_designs()
+    if arg in designs:
+        return designs[arg]
+    names = ", ".join(sorted(designs)) or "<none>"
+    die(f"design {arg!r} not found. Available: {names}\n"
+        f"  Drop .py or .json in {DESIGN_USER_DIR} to add your own.")
+
+
+def design_from_json(path: Path, keymap: dict, num_cells: int) -> bytes:
+    """Render a declarative JSON design into a 128*3 byte buffer.
+
+    Schema:
+      {
+        "name": "...",
+        "description": "...",
+        "base_color": "#RRGGBB",        # optional, default #000000
+        "cells":  {"5": "#RRGGBB", ...} # optional, raw cell index -> colour
+        "keys":   {"W": "#RRGGBB", ...} # optional, name -> colour via keymap
+      }
+    Layering order: base_color fills the whole frame, then `cells`
+    overrides, then `keys` overrides (so a named key beats a cell-index
+    write to the same physical cell).
+    """
+    try:
+        spec = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        die(f"bad design {path}: {e}")
+
+    base = spec.get("base_color", "#000000")
+    r, g, b = parse_rgb(base)
+    buf = bytearray([r, g, b] * num_cells)
+
+    # cell-indexed overrides
+    for k, col in spec.get("cells", {}).items():
+        try:
+            idx = int(k)
+        except ValueError:
+            print(f"  note: design {path.name}: cell key {k!r} isn't an integer", file=sys.stderr)
+            continue
+        if not (0 <= idx < num_cells):
+            continue
+        cr, cg, cb = parse_rgb(col)
+        buf[idx * 3 + 0] = cr
+        buf[idx * 3 + 1] = cg
+        buf[idx * 3 + 2] = cb
+
+    # named-key overrides
+    keys = keymap.get("keys", {})
+    ci_index = {n.lower(): n for n in keys}
+    missing = []
+    for name, col in spec.get("keys", {}).items():
+        cell = keys.get(name)
+        if cell is None:
+            cell = keys.get(ci_index.get(name.lower(), ""))
+        if cell is None:
+            missing.append(name); continue
+        idx = int(cell)
+        if not (0 <= idx < num_cells):
+            continue
+        cr, cg, cb = parse_rgb(col)
+        buf[idx * 3 + 0] = cr
+        buf[idx * 3 + 1] = cg
+        buf[idx * 3 + 2] = cb
+
+    if missing:
+        print(f"  note: keymap is missing {len(missing)} key{'s' if len(missing) != 1 else ''} "
+              f"used by this design: {', '.join(missing)}\n"
+              f"        run `venator map discover` to fill them in.",
+              file=sys.stderr)
+
+    return bytes(buf)
+
+
+def cmd_rgb_design(args: argparse.Namespace) -> None:
+    if args.list:
+        designs = list_designs()
+        if not designs:
+            print(f"  no designs installed")
+            print(f"  shipped: {DESIGN_SHIPPED_DIR}")
+            print(f"  user:    {DESIGN_USER_DIR}")
+            return
+        for name, path in sorted(designs.items()):
+            origin = "shipped" if path.parent == DESIGN_SHIPPED_DIR else "user"
+            print(f"  {name:24s} [{origin}] {path.suffix.lstrip('.')}  {path}")
+        return
+    if not args.name:
+        die("usage: venator rgb design <name> | rgb design --list")
+
+    path = find_design(args.name)
+    keymap = load_keymap()
+
+    if path.suffix == ".json":
+        buf = design_from_json(path, keymap, 128)
+        spec = json.loads(path.read_text())
+        name = spec.get("name", args.name)
+    elif path.suffix == ".py":
+        mod = load_animation(path)   # same loader; designs reuse the render() contract
+        try:
+            buf = mod.render(0, 128, keymap)
+        except Exception as e:
+            die(f"{path}: render() crashed: {e!r}")
+        if not isinstance(buf, (bytes, bytearray)) or len(buf) != PERKEY_BYTES:
+            die(f"{path}: render() must return {PERKEY_BYTES} bytes")
+        name = getattr(mod, "NAME", args.name)
+    else:
+        die(f"unsupported design type: {path.suffix}")
+
+    stop_background()
+    dev = find_device()
+    write_bin_attr(dev, "frame", bytes(buf))
+    write_text_attr(dev, "mode", "perkey")
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    commit(dev)
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+    print(f"applied design {name!r}")
+
+
+def cmd_rgb_key(args: argparse.Namespace) -> None:
+    stop_background()
+    r, g, b = parse_rgb(args.color)
+    km = load_keymap()
+    cells = resolve_key_names([args.name], km)
+    dev = find_device()
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    apply_cell_edits(dev, [(cells[0], r, g, b)])
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+def cmd_rgb_keys(args: argparse.Namespace) -> None:
+    stop_background()
+    names = [n.strip() for n in args.names.split(",") if n.strip()]
+    if not names:
+        die("no key names given")
+    r, g, b = parse_rgb(args.color)
+    km = load_keymap()
+    cells = resolve_key_names(names, km)
+    dev = find_device()
+    if args.brightness is not None:
+        write_text_attr(dev, "brightness", str(args.brightness))
+    apply_cell_edits(dev, [(c, r, g, b) for c in cells])
+    save_default(dev, timeout=args.timeout)
+    start_keepalive(args.timeout)
+
+
+# ------------------------------------------------------------------- map
+
+def cmd_map_show(args: argparse.Namespace) -> None:
+    km = load_keymap(Path(args.path) if args.path else None)
+    keys = km.get("keys", {})
+    if not keys:
+        print(f"(no mappings; run `venator map discover`)")
+        print(f"keymap path: {Path(args.path) if args.path else KEYMAP_DEFAULT}")
+        return
+    print(f"model:       {km.get('model', '?')}")
+    print(f"num_cells:   {km.get('num_cells', 128)}")
+    print(f"mappings:    {len(keys)} of {km.get('num_cells', 128)}")
+    print()
+    for name, cell in sorted(keys.items(), key=lambda kv: int(kv[1])):
+        print(f"  cell {int(cell):3d}  ->  {name}")
+
+
+def cmd_map_unset(args: argparse.Namespace) -> None:
+    km = load_keymap()
+    if args.name not in km.get("keys", {}):
+        die(f"no mapping for {args.name!r}")
+    del km["keys"][args.name]
+    p = save_keymap(km)
+    print(f"removed {args.name!r}; saved {p}")
+
+
+def cmd_map_discover(args: argparse.Namespace) -> None:
+    """Light one cell at a time and ask the user which physical key lit up.
+
+    Writes the answer into the keymap. Restores the previous state on exit.
+    Backs up the current frame+mode+colour+brightness; restores on quit
+    (whether clean exit or Ctrl-C) so the user's setup isn't trampled.
+    """
+    dev = find_device()
+
+    # Backup current state for restoration on exit.
+    backup_mode       = read_text_attr(dev, "mode")
+    backup_color      = read_text_attr(dev, "color")
+    backup_brightness = read_text_attr(dev, "brightness")
+    try:
+        backup_frame = (dev / "frame").read_bytes()
+    except OSError:
+        backup_frame = None
+
+    km = load_keymap()
+    km.setdefault("model", "Predator PH16-71")
+    km.setdefault("num_cells", 128)
+    km.setdefault("keys", {})
+
+    start = max(0, args.start)
+    end   = min(km["num_cells"], args.end if args.end > 0 else km["num_cells"])
+    cur   = start
+    history: list[int] = []
+
+    # Boost brightness so the lit cell is unambiguous.
+    write_text_attr(dev, "brightness", "255")
+
+    print(f"discovery: cells {start}..{end-1}  ({len(km['keys'])} already mapped)")
+    print("  Type the key name for the lit cell. Slash commands:")
+    print("    (just press Enter)   keep existing mapping (if any), advance one cell")
+    print("    /clear               remove the mapping for this cell, advance")
+    print("    /back                go back one cell")
+    print("    /jump <N>            jump to cell N")
+    print("    /show                list mappings so far")
+    print("    /save                save and continue")
+    print("    /quit                save and exit")
+    print("    /                    (one char alone) record this cell as the '/' key")
+    print()
+
+    def cell_by_index(c: int) -> str | None:
+        for name, idx in km["keys"].items():
+            if int(idx) == c:
+                return name
+        return None
+
+    try:
+        while cur < end:
+            # Light only this cell, in white.
+            frame = bytearray(PERKEY_BYTES)
+            frame[cur * 3 + 0] = 0xff
+            frame[cur * 3 + 1] = 0xff
+            frame[cur * 3 + 2] = 0xff
+            write_bin_attr(dev, "frame", bytes(frame))
+            write_text_attr(dev, "mode", "perkey")
+            commit(dev)
+
+            existing = cell_by_index(cur)
+            prompt = f"[cell {cur:3d}"
+            if existing:
+                prompt += f" = {existing!r}"
+            prompt += "] "
+            try:
+                inp = input(prompt).strip()
+            except EOFError:
+                print()
+                break
+
+            if not inp:
+                # Empty input = keep existing mapping (if any), just advance.
+                # Use /clear to actively remove a mapping.
+                history.append(cur); cur += 1; continue
+
+            # Single '/' is the literal slash key. '/<word>' is a command.
+            if inp.startswith("/") and len(inp) > 1:
+                cmd = inp[1:].strip().lower()
+                if cmd == "back":
+                    cur = history.pop() if history else max(start, cur - 1)
+                    continue
+                if cmd == "clear":
+                    if existing:
+                        del km["keys"][existing]
+                        print(f"  removed mapping for cell {cur} ({existing!r})")
+                    else:
+                        print(f"  (cell {cur} not mapped)")
+                    history.append(cur); cur += 1; continue
+                if cmd.startswith("jump"):
+                    parts = cmd.split()
+                    try:
+                        target = int(parts[1])
+                    except (IndexError, ValueError):
+                        print("  usage: /jump <N>"); continue
+                    if not (start <= target < end):
+                        print(f"  out of range [{start}, {end-1}]"); continue
+                    history.append(cur); cur = target; continue
+                if cmd == "show":
+                    for n, c in sorted(km["keys"].items(), key=lambda kv: int(kv[1])):
+                        print(f"    cell {int(c):3d}  ->  {n}")
+                    continue
+                if cmd == "save":
+                    save_keymap(km); print(f"  saved ({len(km['keys'])} keys)"); continue
+                if cmd in ("quit", "q"):
+                    break
+                print(f"  unknown command /{cmd}"); continue
+
+            # Anything else is a key name (case preserved). This includes a
+            # bare "/" for the slash key.
+            if inp in km["keys"] and int(km["keys"][inp]) != cur:
+                print(f"  note: {inp!r} was at cell {int(km['keys'][inp])}, reassigning to {cur}")
+            if existing and existing != inp:
+                del km["keys"][existing]
+            km["keys"][inp] = cur
+            history.append(cur); cur += 1
+    except KeyboardInterrupt:
+        print()
+    finally:
+        # Save whatever we collected.
+        p = save_keymap(km)
+        # Restore prior visual state.
+        if backup_frame is not None:
+            try:
+                write_bin_attr(dev, "frame", backup_frame[:PERKEY_BYTES])
+            except SystemExit:
+                pass
+        if backup_brightness:
+            try: write_text_attr(dev, "brightness", backup_brightness)
+            except SystemExit: pass
+        if backup_color:
+            try: write_text_attr(dev, "color", backup_color)
+            except SystemExit: pass
+        if backup_mode:
+            try: write_text_attr(dev, "mode", backup_mode)
+            except SystemExit: pass
+        try: commit(dev)
+        except SystemExit: pass
+        print(f"\nsaved {len(km['keys'])} mappings to {p}")
+
+
+# -------------------------------------------------------------- profiles
+
+PROFILE_KEYS = ("mode", "color", "brightness", "effect_id")
+
+
+# ---------------------------------------------------- power / thermal / battery
+#
+# Everything in this section talks to *mainline* kernel interfaces — the
+# Predator-specific bits are already exposed by `acer-wmi` (turbo +
+# fans + temps) and `acer_wmi_battery` (charge limit, if loaded). We
+# don't go through our kernel module here. The CLI just wraps the
+# sysfs paths so users get one tool instead of remembering five paths.
+
+PLATFORM_PROFILE = Path("/sys/firmware/acpi/platform_profile")
+PLATFORM_PROFILE_CHOICES = Path("/sys/firmware/acpi/platform_profile_choices")
+
+# Friendly aliases (left) → exact platform_profile_choice (right). The
+# right-hand side must exist in PLATFORM_PROFILE_CHOICES on the target
+# board, else we fall through to the literal value the user typed.
+PROFILE_ALIASES = {
+    "eco":         "low-power",
+    "power-saver": "low-power",
+    "quiet":       "quiet",
+    "default":     "balanced",
+    "balanced":    "balanced",
+    "performance": "balanced-performance",  # PredatorSense's "Performance"
+    "turbo":       "performance",            # PredatorSense's "Turbo"
+}
+
+
+def _read_first_line(p: Path, default: str = "") -> str:
+    try:
+        return p.read_text().strip()
+    except (FileNotFoundError, PermissionError, OSError):
+        return default
+
+
+def _find_acer_hwmon() -> Path | None:
+    """Locate the hwmon directory whose `name` reads `acer` — this is
+    the acer-wmi hwmon device that exposes fan tachs + chassis temps.
+    """
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            if Path(h, "name").read_text().strip() == "acer":
+                return Path(h)
+        except OSError:
+            pass
+    return None
+
+
+def _find_battery() -> Path | None:
+    for b in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        return Path(b)
+    return None
+
+
+def _profile_choices() -> list[str]:
+    raw = _read_first_line(PLATFORM_PROFILE_CHOICES)
+    return raw.split() if raw else []
+
+
+def _resolve_profile(name: str) -> str:
+    """Map a user-supplied name to a real platform_profile choice.
+
+    If the name is already one of the choices, pass it through. If
+    it's a known alias and the alias' target exists in the choices,
+    use that. Otherwise leave it alone and let the kernel reject it
+    with a clear error.
+    """
+    choices = _profile_choices()
+    if name in choices:
+        return name
+    aliased = PROFILE_ALIASES.get(name)
+    if aliased and (not choices or aliased in choices):
+        return aliased
+    return name
+
+
+# ---------------------------- per-source power policy (AC vs battery)
+#
+# PredatorSense on Windows keeps a separate power profile for "plugged
+# in" vs "on battery". We mirror that with a policy file at
+# ~/.config/venator/power-policy.json:
+#
+#     { "ac": "performance", "battery": "balanced" }
+#
+# Values are *raw* platform_profile names (low-power / quiet / balanced /
+# balanced-performance / performance). `power-policy apply` reads the
+# current power source and writes the matching slot. The restore service
+# (`profile load default`) calls apply at login, so the right profile
+# comes back after a reboot.
+#
+# Battery safety: on battery we only allow the three low-heat profiles
+# unless the user explicitly opts into the high-power ones (which spin
+# the fans + drain the pack fast). The raw names that map to
+# PredatorSense's "Performance"/"Turbo" are gated behind --advanced.
+
+POWER_POLICY_PATH = _real_home() / ".config" / "venator" / "power-policy.json"
+
+# Raw platform_profile names considered safe to run on battery.
+BATTERY_SAFE_PROFILES = {"low-power", "quiet", "balanced"}
+
+# First-use defaults: a fresh install with no policy file behaves as
+# "balanced on AC, quiet on battery" — sane out of the box, and what
+# the power-watch daemon applies before the user configures anything.
+POWER_POLICY_DEFAULTS = {"ac": "balanced", "battery": "quiet"}
+
+
+def _read_power_policy() -> dict:
+    if not POWER_POLICY_PATH.exists():
+        return dict(POWER_POLICY_DEFAULTS)
+    try:
+        d = json.loads(POWER_POLICY_PATH.read_text())
+        if not isinstance(d, dict):
+            return dict(POWER_POLICY_DEFAULTS)
+        d.setdefault("ac", POWER_POLICY_DEFAULTS["ac"])
+        d.setdefault("battery", POWER_POLICY_DEFAULTS["battery"])
+        return d
+    except (OSError, json.JSONDecodeError):
+        return dict(POWER_POLICY_DEFAULTS)
+
+
+def _write_power_policy(d: dict) -> None:
+    POWER_POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _chown_to_invoker(POWER_POLICY_PATH.parent)
+    POWER_POLICY_PATH.write_text(json.dumps(d, indent=2, sort_keys=True))
+    _chown_to_invoker(POWER_POLICY_PATH)
+
+
+def _on_ac_power() -> bool | None:
+    """True if a mains adapter reports online, False if one exists and
+    reads offline, None if no adapter is present (e.g. a desktop, or the
+    adapter doesn't expose `online`).
+    """
+    found = False
+    for d in sorted(glob.glob("/sys/class/power_supply/*")):
+        dp = Path(d)
+        try:
+            if (dp / "type").read_text().strip() == "Battery":
+                continue
+        except OSError:
+            continue
+        online = dp / "online"
+        if not online.exists():
+            continue
+        try:
+            val = online.read_text().strip()
+        except OSError:
+            continue
+        found = True
+        if val == "1":
+            return True
+    return False if found else None
+
+
+def _profile_is_battery_safe(raw: str) -> bool:
+    return raw in BATTERY_SAFE_PROFILES
+
+
+def _apply_power_profile(target: str) -> str | None:
+    """Write `target` to platform_profile and run the auto-RGB hook.
+    Returns the resulting profile string, or None on failure (message
+    already written to stderr). Used by the policy + restore paths;
+    cmd_power keeps its own richer messaging.
+    """
+    if not PLATFORM_PROFILE.exists():
+        sys.stderr.write("power-policy: no platform_profile (is acer-wmi loaded?)\n")
+        return None
+    try:
+        PLATFORM_PROFILE.write_text(target)
+    except PermissionError:
+        sys.stderr.write(f"power-policy: permission denied writing {PLATFORM_PROFILE}\n")
+        return None
+    except OSError as e:
+        sys.stderr.write(f"power-policy: kernel rejected {target!r}: {e}\n")
+        return None
+    new = _read_first_line(PLATFORM_PROFILE) or "?"
+    _maybe_apply_power_rgb(new)
+    return new
+
+
+def _remember_power_profile(raw: str) -> None:
+    """Persist `raw` into the policy slot for the *current* power source
+    so a plain `power <profile>` is restored at next login. On battery
+    we only remember battery-safe profiles — we don't want a one-off
+    Turbo burst to become the thing we auto-restore every boot.
+    """
+    on_ac = _on_ac_power()
+    slot = "battery" if on_ac is False else "ac"
+    if slot == "battery" and not _profile_is_battery_safe(raw):
+        return
+    pol = _read_power_policy()
+    if pol.get(slot) == raw:
+        return
+    pol[slot] = raw
+    _write_power_policy(pol)
+
+
+def _apply_power_policy(*, verbose: bool = True) -> None:
+    """Apply the stored profile for the current power source. No-op if
+    nothing is stored for that source. Called by the restore path.
+    """
+    pol = _read_power_policy()
+    on_ac = _on_ac_power()
+    # Unknown source (desktop / no adapter) → fall back to the AC slot.
+    slot = "battery" if on_ac is False else "ac"
+    target = pol.get(slot)
+    if not target:
+        if verbose:
+            sys.stderr.write(f"power-policy: no profile stored for {slot}; skipping\n")
+        return
+    new = _apply_power_profile(target)
+    if new and verbose:
+        src = "AC" if slot == "ac" else "battery"
+        sys.stderr.write(f"power-policy: on {src} -> {new}\n")
+
+
+def cmd_power_policy(args: argparse.Namespace) -> None:
+    """Show the AC/battery power policy + what would be applied now."""
+    pol = _read_power_policy()
+    on_ac = _on_ac_power()
+    src = ("AC" if on_ac is True else
+           "battery" if on_ac is False else
+           "unknown (no adapter detected)")
+    ac_p  = pol.get("ac")  or "(unset)"
+    bat_p = pol.get("battery") or "(unset)"
+    print(f"power source : {src}")
+    print(f"on AC        : {ac_p}")
+    print(f"on battery   : {bat_p}")
+    active_slot = "battery" if on_ac is False else "ac"
+    active = pol.get(active_slot)
+    if active:
+        print(f"would apply  : {active}  (for current source)")
+    print()
+    print("set with:")
+    print("  venator power-policy ac <profile>")
+    print("  venator power-policy battery <profile> [--advanced]")
+    print("  venator power-policy apply        # apply now / used at login")
+    print()
+    print("battery-safe profiles: eco (low-power), quiet, balanced")
+    print("performance/turbo on battery need --advanced (degrades battery).")
+
+
+def cmd_power_policy_set(args: argparse.Namespace) -> None:
+    """Set the policy for one slot (args.slot is 'ac' or 'battery')."""
+    slot = args.slot
+    raw = _resolve_profile(args.profile)
+    if slot == "battery" and not _profile_is_battery_safe(raw):
+        if not getattr(args, "advanced", False):
+            die(f"{args.profile!r} (resolves to {raw!r}) is not allowed on "
+                f"battery.\nBattery-safe profiles: eco, quiet, balanced.\n"
+                f"Pass --advanced to force performance/turbo on battery — "
+                f"this runs the fans hard and degrades battery health.")
+        sys.stderr.write(
+            "WARNING: setting a high-power profile on battery. This drains\n"
+            "         the pack fast and accelerates wear. Proceeding because\n"
+            "         --advanced was given.\n")
+    pol = _read_power_policy()
+    pol[slot] = raw
+    _write_power_policy(pol)
+    print(f"power-policy {slot}: {raw}")
+    # Apply immediately if the current source matches this slot.
+    on_ac = _on_ac_power()
+    cur_slot = "battery" if on_ac is False else "ac"
+    if cur_slot == slot:
+        new = _apply_power_profile(raw)
+        if new:
+            print(f"applied now ({slot} is the current source): {new}")
+
+
+def cmd_power_policy_apply(args: argparse.Namespace) -> None:
+    _apply_power_policy(verbose=True)
+
+
+def cmd_power_policy_clear(args: argparse.Namespace) -> None:
+    if POWER_POLICY_PATH.exists():
+        POWER_POLICY_PATH.unlink()
+        print("power-policy cleared")
+    else:
+        print("no power-policy set")
+
+
+def cmd_power_watch(args: argparse.Namespace) -> None:
+    """Long-running daemon: watch the AC adapter and re-apply the policy
+    profile whenever the laptop is plugged in / unplugged. This is what
+    makes the profile change in real time on plug/unplug.
+
+    Run by the venator-powerwatch.service user unit. Polls the
+    power_supply `online` files (dependency-free, cheap — one tiny read
+    per tick). On a transition it waits `--settle` seconds so our write
+    lands AFTER any still-running daemon (PPD/tuned) re-applies its own
+    choice on the same event, then applies our policy.
+    """
+    if not PLATFORM_PROFILE.exists():
+        die("no platform_profile (acer-wmi loaded?); nothing to watch")
+
+    interval = max(0.5, float(getattr(args, "interval", 2.0)))
+    settle   = max(0.0, float(getattr(args, "settle", 1.0)))
+
+    # One-time heads-up if a competing daemon is active — it'll fight us
+    # on every event; the settle delay helps us win, but masking is the
+    # real fix.
+    active = _active_power_managers()
+    if active:
+        names = ", ".join(label for label, _ in active)
+        sys.stderr.write(
+            f"power-watch: {names} is active and may briefly override the\n"
+            f"             profile on AC change. For rock-solid switching run:\n"
+            f"             venator power --detach-ppd\n")
+
+    sys.stderr.write(
+        f"power-watch: started (interval={interval}s, settle={settle}s)\n")
+
+    # Apply once at startup so state is correct even if we missed an
+    # event while not running.
+    _apply_power_policy(verbose=True)
+    last = _on_ac_power()
+
+    while True:
+        time.sleep(interval)
+        cur = _on_ac_power()
+        if cur == last:
+            continue
+        # Edge detected.
+        src = "AC" if cur is True else "battery" if cur is False else "unknown"
+        sys.stderr.write(f"power-watch: power source changed -> {src}\n")
+        last = cur
+        if settle:
+            time.sleep(settle)
+            # Re-read in case it bounced back during the settle window.
+            cur = _on_ac_power()
+            last = cur
+        _apply_power_policy(verbose=True)
+
+
+def cmd_power(args: argparse.Namespace) -> None:
+    if not PLATFORM_PROFILE.exists():
+        die("no /sys/firmware/acpi/platform_profile on this kernel; need acer-wmi loaded")
+
+    # PPD detach/attach flags can run with or without a profile arg. Run
+    # them first so a combined call like `power turbo --detach-ppd` masks
+    # PPD before we try to set a mode it doesn't know about.
+    if args.detach_ppd:
+        _do_detach_ppd()
+    if args.attach_ppd:
+        _do_attach_ppd()
+
+    current = _read_first_line(PLATFORM_PROFILE) or "?"
+    choices = _profile_choices()
+    if args.name is None:
+        if args.detach_ppd or args.attach_ppd:
+            return
+        print(f"current: {current}")
+        if choices:
+            print(f"choices: {' '.join(choices)}")
+        print()
+        print("aliases:")
+        seen = set()
+        for alias, target in PROFILE_ALIASES.items():
+            if target in choices and (alias, target) not in seen:
+                print(f"  {alias:12s} -> {target}")
+                seen.add((alias, target))
+        print()
+        # Report every power-management daemon we know about, not just
+        # PPD — tuned / auto-cpufreq / etc. fight us the same way.
+        active = _active_power_managers()
+        masked = _masked_power_managers()
+        if active:
+            print("active power managers (these revert profile on AC change):")
+            for label, _unit in active:
+                print(f"  {label}")
+            print("  detach them with: venator power --detach-ppd")
+        elif masked:
+            print("power managers: all masked — venator owns "
+                  "platform_profile")
+            print("  re-attach with: venator power --attach-ppd")
+        else:
+            print("power managers: none active — venator owns "
+                  "platform_profile")
+        return
+    target = _resolve_profile(args.name)
+    try:
+        PLATFORM_PROFILE.write_text(target)
+    except PermissionError:
+        die(f"permission denied writing {PLATFORM_PROFILE} (try sudo, "
+            "or check the predator udev rule applies)")
+    except OSError as e:
+        if "Invalid argument" in str(e) or e.errno == 22:
+            die(f"kernel rejected {target!r}; valid choices: {' '.join(choices)}")
+        die(f"failed to set power profile: {e}")
+    new = _read_first_line(PLATFORM_PROFILE) or "?"
+    print(f"power profile: {current} -> {new}")
+    if new != target:
+        print(f"  (requested {target!r} but kernel reports {new!r})", file=sys.stderr)
+    active = _active_power_managers()
+    if active:
+        names = ", ".join(label for label, _ in active)
+        print(f"note: {names} active. It may revert this on the next AC")
+        print("      plug/unplug. Mask it with: venator power --detach-ppd")
+    # Auto-apply linked RGB scheme if configured for this profile.
+    _maybe_apply_power_rgb(new)
+    # Remember this choice for the current power source so it's restored
+    # at next login (battery-safe profiles only; see _remember_power_profile).
+    _remember_power_profile(new)
+
+
+# ---------------------------- auto-link RGB to power profile
+#
+# Stored at ~/.config/venator/power-rgb.json. Shape:
+#     { "enabled": true,
+#       "mappings": { "low-power": "#0000ff", ..., "performance": "#ff0000" } }
+# The dict key is the *raw* platform_profile name (low-power / quiet /
+# balanced / balanced-performance / performance) — same as what
+# /sys/firmware/acpi/platform_profile_choices reports. Lookup happens
+# AFTER the profile write so a bad colour can't block the profile
+# change.
+
+POWER_RGB_PATH = _real_home() / ".config" / "venator" / "power-rgb.json"
+
+
+def _read_power_rgb() -> dict:
+    if not POWER_RGB_PATH.exists():
+        return {"enabled": False, "mappings": {}}
+    try:
+        d = json.loads(POWER_RGB_PATH.read_text())
+        if not isinstance(d, dict):
+            return {"enabled": False, "mappings": {}}
+        d.setdefault("enabled",  False)
+        d.setdefault("mappings", {})
+        return d
+    except (OSError, json.JSONDecodeError):
+        return {"enabled": False, "mappings": {}}
+
+
+def _write_power_rgb(d: dict) -> None:
+    POWER_RGB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Chown the dir if we got root via sudo.
+    _chown_to_invoker(POWER_RGB_PATH.parent)
+    POWER_RGB_PATH.write_text(json.dumps(d, indent=2, sort_keys=True))
+    _chown_to_invoker(POWER_RGB_PATH)
+
+
+def _maybe_apply_power_rgb(profile: str) -> None:
+    """Look up `profile` in the power-rgb mapping and apply the colour
+    via rgb static. Errors warn instead of dying — the profile change
+    already succeeded by the time we're called, so we don't want a
+    mis-configured colour to fail the whole command.
+
+    Verbose: prints why the lookup was skipped so users debugging
+    `power-rgb` aren't left guessing.
+    """
+    cfg = _read_power_rgb()
+    if not cfg.get("enabled"):
+        if cfg.get("mappings"):
+            print(f"  auto-RGB: disabled (mappings exist; "
+                  f"`venator power-rgb enable` to turn on)")
+        return
+    mappings = cfg.get("mappings", {})
+    colour = mappings.get(profile)
+    if not colour:
+        # Helpful debug: tell the user the lookup happened but missed.
+        if mappings:
+            print(f"  auto-RGB: no mapping for profile {profile!r} "
+                  f"(set one with `power-rgb set {profile} #RRGGBB`)")
+        return
+    norm_colour = colour if colour.startswith("#") else "#" + colour
+    print(f"  auto-RGB: {profile} -> {norm_colour}")
+    # Reuse the same path the rgb static command takes, including the
+    # auto-save of the 'default' profile so the colour persists across
+    # reboots.
+    ns = argparse.Namespace(color=norm_colour, brightness=None,
+                            timeout=DEFAULT_TIMEOUT_S)
+    try:
+        cmd_rgb_static(ns)
+    except SystemExit as e:
+        # die() raises SystemExit(1). Re-print the reason so the user
+        # sees what went wrong (typically "device not found" if the
+        # kernel module isn't loaded, or "permission denied" outside
+        # the predator group).
+        print(f"  auto-RGB: rgb_static failed (exit {e.code}). Is the "
+              f"venator kmod loaded + are you in the predator "
+              f"group?", file=sys.stderr)
+    except Exception as e:
+        print(f"  auto-RGB: rgb_static raised: {e}", file=sys.stderr)
+
+
+def cmd_power_rgb_set(args: argparse.Namespace) -> None:
+    profile = args.profile
+    colour  = args.color
+    parse_rgb(colour)         # parse_rgb -> die() on invalid; no extra check needed
+    # Allow either the friendly alias OR the raw name; canonicalise to
+    # the raw platform_profile name so the lookup later matches.
+    raw = PROFILE_ALIASES.get(profile, profile)
+    cfg = _read_power_rgb()
+    cfg["mappings"][raw] = colour if colour.startswith("#") else "#" + colour
+    # Setting a mapping implies the user wants it applied. Always
+    # enable on `set`; `venator power-rgb disable` is the
+    # explicit opt-out.
+    was_enabled = cfg.get("enabled", False)
+    cfg["enabled"] = True
+    _write_power_rgb(cfg)
+    print(f"power-rgb: {raw} -> {cfg['mappings'][raw]}  (enabled)")
+    if not was_enabled:
+        print("  (auto-apply turned on; disable with: venator power-rgb disable)")
+
+
+def cmd_power_rgb_unset(args: argparse.Namespace) -> None:
+    raw = PROFILE_ALIASES.get(args.profile, args.profile)
+    cfg = _read_power_rgb()
+    if raw in cfg["mappings"]:
+        del cfg["mappings"][raw]
+        _write_power_rgb(cfg)
+        print(f"power-rgb: removed mapping for {raw}")
+    else:
+        print(f"power-rgb: no mapping for {raw}")
+
+
+def cmd_power_rgb_list(_: argparse.Namespace) -> None:
+    cfg = _read_power_rgb()
+    state = "[on]" if cfg.get("enabled") else "[off]"
+    print(f"power-rgb {state}  (config: {POWER_RGB_PATH})")
+    if not cfg["mappings"]:
+        print("  (no mappings)")
+        print("  add one with: venator power-rgb set <profile> <#RRGGBB>")
+        return
+    for k, v in sorted(cfg["mappings"].items()):
+        pretty = next((alias for alias, target
+                       in PROFILE_ALIASES.items() if target == k),
+                      k)
+        print(f"  {k:24s} -> {v}   ({pretty})")
+
+
+def cmd_power_rgb_toggle(args: argparse.Namespace) -> None:
+    cfg = _read_power_rgb()
+    if args.cmd_action == "enable":
+        cfg["enabled"] = True
+    elif args.cmd_action == "disable":
+        cfg["enabled"] = False
+    _write_power_rgb(cfg)
+    print(f"power-rgb: {'enabled' if cfg['enabled'] else 'disabled'}")
+
+
+def cmd_power_rgb_apply(_: argparse.Namespace) -> None:
+    """Force-apply the colour mapping for the current platform profile,
+    regardless of whether the global enable flag is set. Useful for
+    testing a fresh mapping without having to flip profiles."""
+    cur = _read_first_line(PLATFORM_PROFILE) or "?"
+    cfg = _read_power_rgb()
+    mappings = cfg.get("mappings", {})
+    colour = mappings.get(cur)
+    if not colour:
+        die(f"no power-rgb mapping for current profile {cur!r}. "
+            f"Set one with: venator power-rgb set {cur} '#RRGGBB'")
+    norm_colour = colour if colour.startswith("#") else "#" + colour
+    print(f"applying power-rgb for {cur}: {norm_colour}")
+    ns = argparse.Namespace(color=norm_colour, brightness=None,
+                            timeout=DEFAULT_TIMEOUT_S)
+    cmd_rgb_static(ns)
+
+
+PPD_UNIT = "power-profiles-daemon.service"
+
+# Other daemons that also drive /sys/firmware/acpi/platform_profile (or
+# otherwise fight us for CPU/thermal control). On a plug/unplug event
+# they re-apply their own choice, which is exactly what stomps on our
+# per-source policy. We detect every one that's active so the user
+# isn't left wondering why their profile keeps reverting — PPD is just
+# the most common; tuned ships by default on several distros now, and
+# the others show up on System76 / laptop-optimised setups.
+#
+# (label, systemd unit). Order = the order we'd mask them in.
+POWER_MANAGER_UNITS = [
+    ("power-profiles-daemon", "power-profiles-daemon.service"),
+    ("tuned",                 "tuned.service"),
+    ("auto-cpufreq",          "auto-cpufreq.service"),
+    ("system76-power",        "system76-power.service"),
+    ("tlp",                   "tlp.service"),
+]
+
+
+def _systemctl(*args: str, sudo: bool = False) -> subprocess.CompletedProcess:
+    cmd = ["systemctl", *args]
+    if sudo and os.geteuid() != 0:
+        cmd = ["sudo", *cmd]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _unit_is_active(unit: str) -> bool:
+    return _systemctl("is-active", "--quiet", unit).returncode == 0
+
+
+def _unit_is_masked(unit: str) -> bool:
+    return _systemctl("is-enabled", unit).stdout.strip() == "masked"
+
+
+def _active_power_managers() -> list[tuple[str, str]]:
+    """Return [(label, unit), …] for every known power-management daemon
+    that is currently active. Empty list = we own platform_profile.
+    """
+    return [(label, unit) for label, unit in POWER_MANAGER_UNITS
+            if _unit_is_active(unit)]
+
+
+def _masked_power_managers() -> list[tuple[str, str]]:
+    return [(label, unit) for label, unit in POWER_MANAGER_UNITS
+            if _unit_is_masked(unit)]
+
+
+# Back-compat shims: the original code only knew about PPD.
+def _ppd_is_active() -> bool:
+    return _unit_is_active(PPD_UNIT)
+
+
+def _ppd_is_masked() -> bool:
+    return _unit_is_masked(PPD_UNIT)
+
+
+def _do_detach_ppd() -> None:
+    """Mask every active power-management daemon so none of them fight
+    our writes.
+
+    These daemons own /sys/firmware/acpi/platform_profile and typically
+    expose only 3 coarse modes. Any direct write we make (e.g.
+    balanced-performance, or performance for true turbo) survives until
+    the next AC plug/unplug event — then the daemon re-applies its own
+    choice. Masking them stops that and lets venator + the
+    power-watch daemon own the profile.
+    """
+    active = _active_power_managers()
+    if not active:
+        # Nothing active. Mention any that exist-but-inactive for clarity.
+        print("no active power-management daemon found "
+              "(power-profiles-daemon / tuned / auto-cpufreq / …).")
+        print("venator already owns platform_profile.")
+        return
+    for label, unit in active:
+        if _unit_is_masked(unit):
+            print(f"{label}: already masked")
+            continue
+        r = _systemctl("mask", "--now", unit, sudo=True)
+        if r.returncode != 0:
+            sys.stderr.write(f"warning: masking {label} ({unit}) failed: "
+                             f"{r.stderr.strip() or r.stdout.strip()}\n")
+            continue
+        print(f"{label}: masked.")
+    print("venator now owns platform_profile.")
+    print("  re-attach with: venator power --attach-ppd")
+
+
+def _do_attach_ppd() -> None:
+    """Undo --detach-ppd: unmask + start every power manager we masked."""
+    masked = _masked_power_managers()
+    if not masked:
+        print("no power-management daemon is masked; nothing to do")
+        return
+    for label, unit in masked:
+        r = _systemctl("unmask", unit, sudo=True)
+        if r.returncode != 0:
+            sys.stderr.write(f"warning: unmasking {label} ({unit}) failed: "
+                             f"{r.stderr.strip() or r.stdout.strip()}\n")
+            continue
+        _systemctl("start", unit, sudo=True)
+        print(f"{label}: unmasked + started.")
+
+
+PREDATOR_BATTERY_DIR = Path("/sys/class/predator/battery0")
+PREDATOR_GAMING_DIR = Path("/sys/class/predator/gaming0")
+PREDATOR_LIGHTBAR_DIR = Path("/sys/class/predator/lightbar0")
+
+
+def _end_threshold_path() -> Path | None:
+    """Find a writable charge-limit sysfs path.
+
+    Prefer our own kernel module's /sys/class/predator/battery0/
+    (PH16-71 isn't in mainline acer_wmi_battery's quirk list). Fall
+    back to /sys/class/power_supply/BAT*/charge_control_end_threshold
+    for boards that ARE in the mainline quirk list (so the same CLI
+    works on other Acers).
+    """
+    p = PREDATOR_BATTERY_DIR / "charge_control_end_threshold"
+    if p.exists():
+        return p
+    bat = _find_battery()
+    if bat is not None:
+        p = bat / "charge_control_end_threshold"
+        if p.exists():
+            return p
+    return None
+
+
+def cmd_battery_info(_: argparse.Namespace) -> None:
+    bat = _find_battery()
+    if bat is None:
+        die("no /sys/class/power_supply/BAT* on this box")
+    print(f"device: {bat}")
+    for f in ("manufacturer", "model_name", "technology", "status",
+              "capacity", "energy_full", "energy_full_design",
+              "voltage_now", "current_now",
+              "charge_control_start_threshold",
+              "charge_control_end_threshold",
+              "charge_behaviour", "charge_type"):
+        p = bat / f
+        if p.exists():
+            print(f"  {f:34s} {_read_first_line(p)}")
+    # Our own kernel-module-exposed bits, if loaded.
+    if PREDATOR_BATTERY_DIR.exists():
+        print()
+        print(f"predator: {PREDATOR_BATTERY_DIR}")
+        for f in ("charge_control_end_threshold",
+                  "health_mode", "calibration_mode"):
+            p = PREDATOR_BATTERY_DIR / f
+            if p.exists():
+                print(f"  {f:34s} {_read_first_line(p)}")
+    elif not (bat / "charge_control_end_threshold").exists():
+        print()
+        print("  NOTE: no charge-control sysfs found. Load the kernel half:")
+        print("    sudo modprobe venator   # or `sudo make install`")
+        print("  Then re-run `venator battery info`.")
+
+
+def cmd_battery_limit(args: argparse.Namespace) -> None:
+    end_p = _end_threshold_path()
+    if args.value is None:
+        if end_p is None:
+            die("no charge-control sysfs present; reload venator")
+        print(_read_first_line(end_p))
+        return
+    if end_p is None:
+        die("no charge-control sysfs present; reload venator and retry")
+    v = args.value.strip().lower()
+    if v in ("on", "enable", "enabled"):
+        target = 80         # PH16-71 firmware-fixed cap
+    elif v in ("off", "none", "disable", "disabled", "100"):
+        target = 100
+    else:
+        try:
+            target = int(v)
+        except ValueError:
+            die(f"expected 'on' / 'off' / percent (1..100), got {args.value!r}")
+        if not 1 <= target <= 100:
+            die("limit must be 1..100, 'on', or 'off'")
+    try:
+        end_p.write_text(str(target))
+    except PermissionError:
+        die(f"permission denied writing {end_p} (try sudo, or check the "
+            "predator group + udev rule)")
+    except OSError as e:
+        if e.errno in (22, 34):  # EINVAL or ERANGE
+            die(f"kernel rejected {target}; PH16-71 only supports 80 (cap) "
+                "or 100 (off)")
+        die(f"failed to set charge limit: {e}")
+    actual = _read_first_line(end_p)
+    print(f"battery charge limit: {actual}%")
+    if str(target) != actual:
+        print(f"  (requested {target}%; firmware applied {actual}% — "
+              "PH16-71 only offers fixed 80% cap)", file=sys.stderr)
+
+
+# ---------------------------------------------------- misc (LCD overdrive, etc)
+#
+# Reverse-engineered from AcerAgentService.exe's per-feature transport
+# wrappers. The kernel half (venator-gaming.c) packs the u64 and calls
+# WMBH; we just expose the on/off knobs here.
+
+_MISC_ATTRS = {
+    "lcd-overdrive": ("lcd_overdrive",
+                      "165 Hz LCD overdrive — sharper transitions at the "
+                      "cost of slight overshoot ghosting."),
+    "boot-sound":    ("boot_sound",
+                      "Acer chime at boot. Persists in firmware."),
+}
+
+
+def _misc_path(name: str) -> Path:
+    attr, _help = _MISC_ATTRS[name]
+    return PREDATOR_GAMING_DIR / attr
+
+
+def cmd_misc(args: argparse.Namespace) -> None:
+    if not PREDATOR_GAMING_DIR.exists():
+        die("no /sys/class/predator/gaming0 — reload venator "
+            "(your kernel may not have built the WMBH half, or this "
+            "firmware doesn't expose WMBH)")
+    if args.feature is None:
+        # status dump
+        for cli_name, (attr, help_) in _MISC_ATTRS.items():
+            p = PREDATOR_GAMING_DIR / attr
+            v = _read_first_line(p) if p.exists() else "(unavailable)"
+            print(f"  {cli_name:18s} {v:8s}  {help_}")
+        return
+    if args.feature not in _MISC_ATTRS:
+        die(f"unknown feature {args.feature!r}; known: "
+            + ", ".join(sorted(_MISC_ATTRS)))
+    p = _misc_path(args.feature)
+    if args.value is None:
+        if not p.exists():
+            die(f"{p} not present — feature unsupported by firmware")
+        print(_read_first_line(p))
+        return
+    v = args.value.strip().lower()
+    if v in ("on", "1", "true", "enable", "enabled"):
+        target = "1"
+    elif v in ("off", "0", "false", "disable", "disabled"):
+        target = "0"
+    else:
+        die(f"expected on/off (or 1/0), got {args.value!r}")
+    try:
+        p.write_text(target)
+    except PermissionError:
+        die(f"permission denied writing {p} (try sudo, or check the "
+            "predator group + udev rule)")
+    except OSError as e:
+        die(f"failed to set {args.feature}: {e}")
+    print(f"{args.feature}: {_read_first_line(p)}")
+
+
+# ---------------------------------------------------- lightbar (rear EC RGB)
+#
+# /sys/class/predator/lightbar0/{mode, brightness, color, speed, direction,
+# apply, set, modes}. The `set` attr is the fast path — single write
+# atomically updates all five fields and commits. `apply` commits the
+# currently cached state without changing it.
+
+# Firmware-supported lightbar effects (byte 0 of the
+# SetGamingKBBacklight 16-byte buffer). IDs are NON-CONTIGUOUS —
+# 0x00..0x07 are the eight animated effects + off, 0xFF is the
+# "Direct" / Static mode. The kernel's lb_modes_catalog accepts
+# these exact names.
+LB_MODE_IDS = {
+    "off":       0x00,
+    "breathing": 0x01,
+    "neon":      0x02,
+    "rainbow":   0x03,
+    "wave":      0x04,
+    "ripple":    0x05,
+    "scanner":   0x06,
+    "strobe":    0x07,
+    "static":    0xff,
+}
+LB_MODES = tuple(LB_MODE_IDS.keys())
+
+
+def _lb_path(attr: str) -> Path:
+    return PREDATOR_LIGHTBAR_DIR / attr
+
+
+def _require_lightbar() -> None:
+    if not PREDATOR_LIGHTBAR_DIR.exists():
+        die("no /sys/class/predator/lightbar0 — reload venator "
+            "(your kernel may not have built the WMBH lightbar half, "
+            "or this firmware doesn't expose the lightbar method)")
+
+
+def _hex_to_rgb(s: str) -> tuple[int, int, int]:
+    s = s.strip().lstrip("#")
+    if len(s) != 6:
+        die(f"colour must be RRGGBB hex, got {s!r}")
+    try:
+        return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+    except ValueError:
+        die(f"colour must be RRGGBB hex, got {s!r}")
+
+
+def _write_lb(attr: str, value: str) -> None:
+    p = _lb_path(attr)
+    if not p.exists():
+        die(f"sysfs attr {p} doesn't exist — your kernel module is "
+            f"older than this CLI. Rebuild + reload it:\n"
+            f"  sudo make akmods-install\n"
+            f"  sudo modprobe -r venator && sudo modprobe venator\n"
+            f"  ls /sys/class/predator/lightbar0/   # should now list '{attr}'")
+    try:
+        p.write_text(value)
+    except PermissionError:
+        die(f"permission denied writing {p}.\n"
+            f"  - confirm you're in the 'predator' group:  groups | grep predator\n"
+            f"  - reload udev:  sudo udevadm control --reload && "
+            f"sudo udevadm trigger -s predator\n"
+            f"  - if still failing: sudo chmod g+w {p}")
+    except OSError as e:
+        die(f"failed to write {attr}: {e}")
+
+
+def cmd_lightbar_status(_: argparse.Namespace) -> None:
+    _require_lightbar()
+    for attr in ("mode", "brightness", "speed", "direction", "color"):
+        p = _lb_path(attr)
+        if p.exists():
+            print(f"  {attr:11s} {_read_first_line(p)}")
+
+
+def cmd_lightbar_off(_: argparse.Namespace) -> None:
+    _require_lightbar()
+    _write_lb("mode", "off")
+    _write_lb("apply", "1")
+    _autosave_lightbar()
+    print("lightbar: off")
+
+
+def _validate_lb_mode(name: str) -> str:
+    """Normalise + validate a user-supplied mode name. The kernel
+    accepts the same names — see lb_modes_catalog in
+    venator-gaming.c.
+    """
+    n = name.strip().lower()
+    if n not in LB_MODES:
+        die(f"unknown mode {name!r}; known: {', '.join(LB_MODES)}")
+    return n
+
+
+def cmd_lightbar_mode(args: argparse.Namespace) -> None:
+    _require_lightbar()
+    name = _validate_lb_mode(args.name)
+    _write_lb("mode", name)
+    _write_lb("apply", "1")
+    _autosave_lightbar()
+    print(f"lightbar mode: {_read_first_line(_lb_path('mode'))}")
+
+
+def cmd_lightbar_color(args: argparse.Namespace) -> None:
+    _require_lightbar()
+    r, g, b = _hex_to_rgb(args.color)
+    _write_lb("color", f"{r:02x}{g:02x}{b:02x}")
+    _write_lb("apply", "1")
+    _autosave_lightbar()
+    print(f"lightbar color: #{r:02x}{g:02x}{b:02x}")
+
+
+def cmd_lightbar_brightness(args: argparse.Namespace) -> None:
+    _require_lightbar()
+    v = int(args.value)
+    if not 0 <= v <= 255:
+        die("brightness must be 0..255")
+    _write_lb("brightness", str(v))
+    _write_lb("apply", "1")
+    _autosave_lightbar()
+    print(f"lightbar brightness: {v}")
+
+
+def cmd_lightbar_speed(args: argparse.Namespace) -> None:
+    _require_lightbar()
+    v = int(args.value)
+    if not 0 <= v <= 255:
+        die("speed must be 0..255")
+    _write_lb("speed", str(v))
+    _write_lb("apply", "1")
+    _autosave_lightbar()
+    print(f"lightbar speed: {v}")
+
+
+def cmd_lightbar_set(args: argparse.Namespace) -> None:
+    """Atomic update — single write to /set."""
+    _require_lightbar()
+    if args.mode is None and args.color is None:
+        die("provide at least --mode or --color")
+
+    # Read current state for defaults
+    current_mode = _read_first_line(_lb_path("mode")) or "breathing"
+    current_b = int(_read_first_line(_lb_path("brightness")) or "100")
+    current_s = int(_read_first_line(_lb_path("speed")) or "5")
+    cur_hex = _read_first_line(_lb_path("color")) or "ff0000"
+    cur_r = int(cur_hex[0:2], 16)
+    cur_g = int(cur_hex[2:4], 16)
+    cur_b = int(cur_hex[4:6], 16)
+
+    if args.mode is not None:
+        name = _validate_lb_mode(args.mode)
+    else:
+        name = current_mode if current_mode in LB_MODE_IDS else "breathing"
+    mode_id = LB_MODE_IDS[name]
+
+    if args.color is not None:
+        r, g, b = _hex_to_rgb(args.color)
+    else:
+        r, g, b = cur_r, cur_g, cur_b
+
+    bright = args.brightness if args.brightness is not None else current_b
+    speed = args.speed if args.speed is not None else current_s
+    if not 0 <= bright <= 255:
+        die("brightness must be 0..255")
+    if not 0 <= speed <= 255:
+        die("speed must be 0..255")
+
+    _write_lb("set", f"{mode_id} {bright} {speed} {r} {g} {b}")
+    _autosave_lightbar()
+    print(f"lightbar: mode={name} "
+          f"color=#{r:02x}{g:02x}{b:02x} bright={bright} speed={speed}")
+
+
+def cmd_lightbar_apply(_: argparse.Namespace) -> None:
+    _require_lightbar()
+    _write_lb("apply", "1")
+    _autosave_lightbar()
+    print("lightbar: applied current state")
+
+
+def cmd_lightbar_wake(args: argparse.Namespace) -> None:
+    """Recover a stuck-off lightbar.
+
+    The firmware sometimes ends up in a "logical off" state where
+    `mode static` and `mode breathing` both come back silently
+    successful but the strip stays dark. (Easiest way to get there:
+    write the `2 10 00 00 00 00 00 f5 ff` SetGamingLED reset that
+    AcerECLightbarController uses internally.) On the first session
+    after that, only the FULL init sequence — mode breathing once,
+    then whatever you actually want — gets the strip lit again. This
+    command does exactly that.
+    """
+    _require_lightbar()
+    # breathing → static (the sequence empirically observed to wake the
+    # strip after a SetGamingLED reset)
+    _write_lb("set", "1 100 5 255 0 0")
+    time.sleep(0.3)
+    target = (args.mode or "static").strip().lower()
+    if target not in LB_MODE_IDS:
+        die(f"unknown mode {target!r}; known: {', '.join(LB_MODES)}")
+    mode_id = LB_MODE_IDS[target]
+    # 100 brightness, 5 speed, R=FF G=00 B=00 — predictable wake state
+    _write_lb("set", f"{mode_id} 100 5 255 0 0")
+    _autosave_lightbar()
+    print(f"lightbar woken (mode={target}, red, brightness 100)")
+
+
+# ---- unified themes (keyboard + lightbar in one shot) -----------------------
+
+def _unified_dirs() -> list[Path]:
+    """Search order: user overrides, source checkout, system installs."""
+    out: list[Path] = []
+    cfg = _real_home() / ".config" / "venator" / "designs" / "unified"
+    if cfg.is_dir():
+        out.append(cfg)
+    here = Path(__file__).resolve().parent
+    for cand in (here / "designs" / "unified",
+                 Path("/usr/local/share/venator/designs/unified"),
+                 Path("/usr/share/venator/designs/unified")):
+        if cand.is_dir():
+            out.append(cand)
+    return out
+
+
+def _find_unified(name_or_path: str) -> Path:
+    p = Path(name_or_path)
+    if p.suffix == ".json" and p.is_file():
+        return p
+    name = name_or_path
+    if not name.endswith(".json"):
+        name = name + ".json"
+    for d in _unified_dirs():
+        cand = d / name
+        if cand.is_file():
+            return cand
+    die(f"unified theme {name_or_path!r} not found. Try "
+        f"`venator unified list`.")
+
+
+def _list_unified() -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for d in _unified_dirs():
+        for f in sorted(d.glob("*.json")):
+            out.setdefault(f.stem, f)
+    return out
+
+
+def cmd_unified_list(_: argparse.Namespace) -> None:
+    themes = _list_unified()
+    if not themes:
+        print("no unified themes found")
+        return
+    for name, path in sorted(themes.items()):
+        try:
+            data = json.loads(path.read_text())
+            desc = data.get("description", "")
+        except (OSError, ValueError):
+            desc = "(failed to parse)"
+        print(f"  {name:18s}  {desc}")
+
+
+def _apply_keyboard_section(kb: dict, timeout: int) -> None:
+    """Apply the 'keyboard' half of a unified theme."""
+    if not isinstance(kb, dict):
+        return
+    mode = (kb.get("mode") or "").strip().lower()
+    color = (kb.get("color") or "").lstrip("#")
+    try:
+        bright = int(kb.get("brightness", 200))
+    except (TypeError, ValueError):
+        bright = 200
+    if mode == "off":
+        # Use the canonical off path so background workers are stopped.
+        subprocess.run([sys.argv[0], "rgb", "off"],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+        return
+    # Static / breathing / firmware effect mode.
+    args = [sys.argv[0], "rgb", "effect", mode]
+    if color:
+        args += ["--color", color]
+    args += ["--brightness", str(bright)]
+    if timeout > 0:
+        args += ["--timeout", str(timeout)]
+    try:
+        subprocess.run(args, timeout=10)
+    except Exception as e:
+        print(f"  keyboard half failed: {e}", file=sys.stderr)
+
+
+def _apply_lightbar_section(lb: dict) -> None:
+    """Apply the 'lightbar' half of a unified theme."""
+    if not isinstance(lb, dict):
+        return
+    if not PREDATOR_LIGHTBAR_DIR.exists():
+        print("  lightbar half skipped: no /sys/class/predator/lightbar0")
+        return
+    mode_name = (lb.get("mode") or "").strip().lower()
+    if mode_name not in LB_MODE_IDS:
+        print(f"  lightbar half skipped: unknown mode {mode_name!r}")
+        return
+    mode_id = LB_MODE_IDS[mode_name]
+    try:
+        bright = int(lb.get("brightness", 100))
+    except (TypeError, ValueError):
+        bright = 100
+    try:
+        speed = int(lb.get("speed", 5))
+    except (TypeError, ValueError):
+        speed = 5
+    color = (lb.get("color") or "ff0000").lstrip("#")
+    try:
+        r = int(color[0:2], 16); g = int(color[2:4], 16); b = int(color[4:6], 16)
+    except (ValueError, IndexError):
+        r, g, b = 0xff, 0, 0
+    try:
+        _write_lb("set", f"{mode_id} {bright} {speed} {r} {g} {b}")
+        _autosave_lightbar()
+    except SystemExit:
+        pass
+
+
+def cmd_unified_apply(args: argparse.Namespace) -> None:
+    path = _find_unified(args.name)
+    try:
+        theme = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        die(f"failed to read theme {path}: {e}")
+    timeout = args.timeout if args.timeout is not None else 0
+    print(f"applying unified theme: {theme.get('name', path.stem)}")
+    if theme.get("description"):
+        print(f"  {theme['description']}")
+    if "keyboard" in theme:
+        _apply_keyboard_section(theme["keyboard"], timeout)
+    if "lightbar" in theme:
+        _apply_lightbar_section(theme["lightbar"])
+    print("done.")
+
+
+def cmd_unified_save(args: argparse.Namespace) -> None:
+    """Snapshot the current keyboard + lightbar state into a new
+    unified-theme JSON under ~/.config/venator/designs/unified/.
+    """
+    dev = find_device()
+    kb = {
+        "mode":  read_text_attr(dev, "mode"),
+        "color": "#" + read_text_attr(dev, "color"),
+        "brightness": int(read_text_attr(dev, "brightness") or "200"),
+    }
+    lb = _snapshot_lightbar()
+    if lb is not None:
+        lb_out = {
+            "mode":       lb.get("mode"),
+            "color":      "#" + lb.get("color", "ff0000"),
+            "brightness": int(lb.get("brightness", "100")),
+            "speed":      int(lb.get("speed", "5")),
+        }
+    else:
+        lb_out = None
+    theme = {
+        "name":        args.name,
+        "description": args.description or
+                       f"saved snapshot from {datetime.datetime.now():%Y-%m-%d}",
+        "keyboard":    kb,
+    }
+    if lb_out is not None:
+        theme["lightbar"] = lb_out
+    dest_dir = _real_home() / ".config" / "venator" / "designs" / "unified"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    _chown_to_invoker(dest_dir.parent.parent)
+    _chown_to_invoker(dest_dir.parent)
+    _chown_to_invoker(dest_dir)
+    dest = dest_dir / f"{args.name}.json"
+    dest.write_text(json.dumps(theme, indent=2, sort_keys=True))
+    _chown_to_invoker(dest)
+    print(f"saved unified theme: {dest}")
+
+
+# ---- unified animations (synchronized keyboard + lightbar) -----------------
+
+def _unified_anim_dirs() -> list[Path]:
+    """Same lookup order as _unified_dirs but for animations."""
+    out: list[Path] = []
+    cfg = _real_home() / ".config" / "venator" / "animations" / "unified"
+    if cfg.is_dir():
+        out.append(cfg)
+    here = Path(__file__).resolve().parent
+    for cand in (here / "animations" / "unified",
+                 Path("/usr/local/share/venator/animations/unified"),
+                 Path("/usr/share/venator/animations/unified")):
+        if cand.is_dir():
+            out.append(cand)
+    return out
+
+
+def _find_unified_anim(name_or_path: str) -> Path:
+    p = Path(name_or_path)
+    if p.suffix == ".py" and p.is_file():
+        return p
+    name = name_or_path if name_or_path.endswith(".py") else name_or_path + ".py"
+    for d in _unified_anim_dirs():
+        cand = d / name
+        if cand.is_file():
+            return cand
+    die(f"unified animation {name_or_path!r} not found in: "
+        + ", ".join(str(d) for d in _unified_anim_dirs()))
+
+
+def _list_unified_anims() -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for d in _unified_anim_dirs():
+        for f in sorted(d.glob("*.py")):
+            out.setdefault(f.stem, f)
+    return out
+
+
+def _apply_unified_step(state: dict) -> None:
+    """Push one synchronized frame to keyboard + lightbar.
+
+    Goes via the existing rgb/lightbar code paths so brightness/mode
+    handling stays canonical. Errors on one half don't kill the loop.
+    """
+    kb = state.get("keyboard")
+    if isinstance(kb, dict):
+        mode = (kb.get("mode") or "static").strip().lower()
+        color = (kb.get("color") or "").lstrip("#")
+        bright = kb.get("brightness")
+        try:
+            dev = find_device()
+        except SystemExit:
+            dev = None
+        if dev is not None:
+            try:
+                if mode in ("off", ""):
+                    write_text_attr(dev, "mode", "off")
+                else:
+                    write_text_attr(dev, "mode", mode)
+                    if color:
+                        write_text_attr(dev, "color", color)
+                    if bright is not None:
+                        write_text_attr(dev, "brightness", str(int(bright)))
+                commit(dev)
+            except OSError as e:
+                sys.stderr.write(f"keyboard step failed: {e}\n")
+
+    lb = state.get("lightbar")
+    if isinstance(lb, dict) and PREDATOR_LIGHTBAR_DIR.exists():
+        mode_name = (lb.get("mode") or "static").strip().lower()
+        if mode_name in LB_MODE_IDS:
+            mode_id = LB_MODE_IDS[mode_name]
+            try:
+                bright = int(lb.get("brightness", 100))
+            except (TypeError, ValueError):
+                bright = 100
+            try:
+                speed = int(lb.get("speed", 5))
+            except (TypeError, ValueError):
+                speed = 5
+            hex_c = (lb.get("color") or "ff0000").lstrip("#")
+            try:
+                r = int(hex_c[0:2], 16); g = int(hex_c[2:4], 16); b = int(hex_c[4:6], 16)
+            except (ValueError, IndexError):
+                r, g, b = 0xff, 0, 0
+            try:
+                (PREDATOR_LIGHTBAR_DIR / "set").write_text(
+                    f"{mode_id} {bright} {speed} {r} {g} {b}")
+            except OSError as e:
+                sys.stderr.write(f"lightbar step failed: {e}\n")
+
+
+def cmd_unified_anim(args: argparse.Namespace) -> None:
+    """Run a synchronized keyboard + lightbar animation in the
+    foreground. Ctrl-C stops cleanly.
+    """
+    import importlib.util
+    import signal as _signal
+
+    if args.name == "list":
+        anims = _list_unified_anims()
+        if not anims:
+            print("no unified animations found")
+            return
+        for name, p in sorted(anims.items()):
+            spec = importlib.util.spec_from_file_location(name, p)
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)
+                desc = getattr(mod, "DESCRIPTION", "")
+            except Exception:
+                desc = "(failed to import)"
+            print(f"  {name:18s}  {desc}")
+        return
+
+    path = _find_unified_anim(args.name)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "step"):
+        die(f"{path.name} doesn't define step(t)")
+    fps = max(1, int(getattr(mod, "FPS", 6)))
+    period = 1.0 / fps
+
+    stop = {"v": False}
+    def _sigterm(_a, _b): stop["v"] = True
+    _signal.signal(_signal.SIGINT, _sigterm)
+    _signal.signal(_signal.SIGTERM, _sigterm)
+
+    print(f"running unified animation '{path.stem}' @ {fps} FPS — Ctrl-C to stop")
+    start = time.time()
+    deadline = (start + args.timeout) if args.timeout > 0 else None
+    while not stop["v"]:
+        t = time.time() - start
+        if deadline and time.time() >= deadline:
+            break
+        try:
+            state = mod.step(t)
+        except Exception as e:
+            sys.stderr.write(f"step failed: {e}\n")
+            break
+        if isinstance(state, dict):
+            _apply_unified_step(state)
+        time.sleep(period)
+    print("animation stopped, last frame held")
+
+
+def cmd_lightbar_modes(_: argparse.Namespace) -> None:
+    """List the modes the kernel reports it supports."""
+    _require_lightbar()
+    p = _lb_path("modes")
+    if p.exists():
+        print(p.read_text(), end="")
+    else:
+        # Fall back to the userspace catalog
+        for i, name in enumerate(LB_MODES):
+            print(f"{i} {name}")
+
+
+
+
+# ---- lightbar animations ----------------------------------------------------
+
+def _lb_animation_dirs() -> list[Path]:
+    """Search order:
+       1. ~/.config/venator/animations/lightbar/   (user overrides)
+       2. Source-checkout sibling (cli/ and gui/ next to each other)
+       3. /usr/local/share/venator/animations/lightbar/
+       4. /usr/share/venator/animations/lightbar/
+
+    Note: the Makefile installs `cli/animations/*` to
+    `$SHAREDIR/animations/*` (no `cli/` segment), so the system paths
+    below intentionally drop that segment too.
+    """
+    out: list[Path] = []
+    cfg = _real_home() / ".config" / "venator" / "animations" / "lightbar"
+    if cfg.is_dir():
+        out.append(cfg)
+    here = Path(__file__).resolve().parent
+    for cand in (here / "animations" / "lightbar",
+                 Path("/usr/local/share/venator/animations/lightbar"),
+                 Path("/usr/share/venator/animations/lightbar")):
+        if cand.is_dir():
+            out.append(cand)
+    return out
+
+
+def _find_lb_animation(name_or_path: str) -> Path:
+    p = Path(name_or_path)
+    if p.suffix == ".py" and p.is_file():
+        return p
+    name = name_or_path
+    if not name.endswith(".py"):
+        name = name + ".py"
+    for d in _lb_animation_dirs():
+        cand = d / name
+        if cand.is_file():
+            return cand
+    die(f"animation {name_or_path!r} not found in: "
+        + ", ".join(str(d) for d in _lb_animation_dirs()))
+
+
+def _list_lb_animations() -> dict[str, Path]:
+    out: dict[str, Path] = {}
+    for d in _lb_animation_dirs():
+        for f in sorted(d.glob("*.py")):
+            out.setdefault(f.stem, f)
+    return out
+
+
+def _apply_lb_step(state: dict) -> None:
+    """Push one frame of animation state to the kernel."""
+    # Order matters: mode + speed/brightness first (cheap single
+    # WMI call), then per-zone overrides.
+    if any(k in state for k in ("mode", "color", "brightness", "speed")):
+        args = ["lightbar", "set"]
+        if "mode" in state:
+            args += ["--mode", str(state["mode"])]
+        if "color" in state:
+            args += ["--color", str(state["color"])]
+        if "brightness" in state:
+            args += ["--brightness", str(int(state["brightness"]))]
+        if "speed" in state:
+            args += ["--speed", str(int(state["speed"]))]
+        # Run silently — animation steps shouldn't print every frame.
+        try:
+            subprocess.run([sys.argv[0], *args],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=2)
+        except Exception:
+            pass
+    # Note: `zone_colors` dict in animation step output is silently
+    # ignored — per-zone WMBH access doesn't work on PH16-71 firmware.
+    # Animations should set the global `color` for visible effect.
+
+
+def cmd_lightbar_anim(args: argparse.Namespace) -> None:
+    """Run a lightbar animation (foreground; Ctrl-C to stop)."""
+    import importlib.util
+    import signal as _signal
+
+    _require_lightbar()
+    if args.name == "list":
+        anims = _list_lb_animations()
+        if not anims:
+            print("no lightbar animations found")
+            return
+        for name, p in sorted(anims.items()):
+            spec = importlib.util.spec_from_file_location(name, p)
+            mod = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(mod)
+                desc = getattr(mod, "DESCRIPTION", "")
+            except Exception:
+                desc = "(failed to import)"
+            print(f"  {name:24s}  {desc}")
+        return
+
+    path = _find_lb_animation(args.name)
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "step"):
+        die(f"{path.name} doesn't define step(t)")
+    fps = max(1, int(getattr(mod, "FPS", 10)))
+    period = 1.0 / fps
+
+    stop = {"v": False}
+    def _sigterm(_a, _b): stop["v"] = True
+    _signal.signal(_signal.SIGINT, _sigterm)
+    _signal.signal(_signal.SIGTERM, _sigterm)
+
+    print(f"running lightbar animation '{path.stem}' at {fps} FPS — Ctrl-C to stop")
+    start = time.time()
+    deadline = (start + args.timeout) if args.timeout > 0 else None
+    while not stop["v"]:
+        t = time.time() - start
+        if deadline and time.time() >= deadline:
+            break
+        try:
+            state = mod.step(t)
+        except Exception as e:
+            sys.stderr.write(f"animation step failed: {e}\n")
+            break
+        if isinstance(state, dict):
+            _apply_lb_step(state)
+        time.sleep(period)
+
+    # Turn the bar off cleanly when the animation ends. The user can
+    # rerun their last `lightbar set` to bring it back.
+    try:
+        subprocess.run([sys.argv[0], "lightbar", "off"],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
+    print("animation stopped, lightbar off")
+
+
+def cmd_tui(args: argparse.Namespace) -> None:
+    """Launch the Textual TUI. Searches the usual install paths + a
+    source checkout. Forwards any extra argv straight through.
+    """
+    candidates = [
+        Path("/usr/local/share/venator/gui/tui.py"),
+        Path("/usr/share/venator/gui/tui.py"),
+        # Source checkout: alongside cli/venator
+        Path(__file__).resolve().parent.parent / "gui" / "tui.py",
+        # Or under /usr/local/bin's sibling /usr/local/share
+        Path(sys.argv[0]).resolve().parent.parent / "share" / "venator" / "gui" / "tui.py",
+    ]
+    tui_path = next((p for p in candidates if p.is_file()), None)
+    if tui_path is None:
+        die("can't find tui.py — install via `sudo make akmods-install` "
+            "or run from a source checkout (cli/ + gui/ as siblings)")
+    extra = getattr(args, "tui_args", []) or []
+    try:
+        os.execvp(sys.executable, [sys.executable, str(tui_path), *extra])
+    except OSError as e:
+        die(f"failed to exec TUI: {e}")
+
+
+def cmd_battery_behaviour(args: argparse.Namespace) -> None:
+    bat = _find_battery()
+    if bat is None:
+        die("no /sys/class/power_supply/BAT* on this box")
+    p = bat / "charge_behaviour"
+    if not p.exists():
+        die("charge_behaviour not exposed by this kernel/driver")
+    if args.name is None:
+        print(_read_first_line(p))
+        return
+    try:
+        p.write_text(args.name)
+    except PermissionError:
+        die(f"permission denied writing {p} (try sudo)")
+    except OSError as e:
+        die(f"failed to set charge_behaviour: {e}")
+    print(f"charge_behaviour: {_read_first_line(p)}")
+
+
+# The `name=acer` hwmon device that the mainline acer-wmi driver
+# creates doesn't label its inputs (no fan*_label / temp*_label files),
+# so the kernel exposes them as opaque fan1/fan2/temp1/temp2/temp3.
+# These mappings are derived from cross-checking against PredatorSense
+# V3 source maps and from running fan stress tests on a PH16-71:
+#
+#   fan1  = left  blower  (intakes cool air over the CPU heatsink)
+#   fan2  = right blower  (intakes over the GPU heatsink)
+#   temp1 = CPU  package sensor (matches coretemp's Package id 0)
+#   temp2 = GPU  sensor — reads 0 when the dGPU is in D3cold / power
+#           saving; populated when the dGPU is active
+#   temp3 = chassis / system ambient (palmrest / motherboard area)
+#
+# Codenames in firmware (so power users can grep DSDT):
+#   fan1 -> CPUF / EFAN  (Embedded Controller fan tach 0x00..0x07)
+#   fan2 -> GPUF         (EC fan tach 0x10..0x17)
+#   temp1 -> CTMP        (EC byte 0x20)
+#   temp2 -> GTMP        (EC byte 0x21)
+#   temp3 -> STMP        (EC byte 0x22)
+ACER_HWMON_FANS = {
+    1: ("fan1", "left  / CPU blower"),
+    2: ("fan2", "right / GPU blower"),
+}
+ACER_HWMON_TEMPS = {
+    1: ("CPU      (acer/temp1, EC CTMP)",  "cpu"),
+    2: ("GPU      (acer/temp2, EC GTMP)",  "gpu"),
+    3: ("chassis  (acer/temp3, EC STMP)",  "sys"),
+}
+
+
+def cmd_thermal(_: argparse.Namespace) -> None:
+    hwm = _find_acer_hwmon()
+    if hwm is None:
+        print("acer hwmon: (not found; is acer-wmi loaded?)")
+    else:
+        print(f"chassis sensors  ({hwm}, name=acer):")
+        for i, (_short, descr) in ACER_HWMON_FANS.items():
+            v = _read_first_line(hwm / f"fan{i}_input")
+            if v:
+                print(f"  fan{i}  {descr:30s}  {int(v):>5} rpm")
+        for i, (label, _short) in ACER_HWMON_TEMPS.items():
+            v = _read_first_line(hwm / f"temp{i}_input")
+            if not v:
+                continue
+            if v == "0":
+                print(f"  temp{i} {label:38s}     —   (idle / D3cold)")
+            else:
+                print(f"  temp{i} {label:38s}  {int(v)//1000:>3} °C")
+    # CPU package temp from coretemp / k10temp — same physical sensor
+    # as acer/temp1 but read directly off the CPU instead of via EC.
+    print()
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = _read_first_line(Path(h, "name"))
+        if name in ("coretemp", "k10temp"):
+            v = _read_first_line(Path(h, "temp1_input"))
+            label = _read_first_line(Path(h, "temp1_label")) or "package"
+            if v:
+                print(f"  cpu  {f'({label})':32s}  {int(v)//1000:>3} °C")
+    for h in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        name = _read_first_line(Path(h, "name"))
+        if name == "nvme":
+            v = _read_first_line(Path(h, "temp1_input"))
+            if v:
+                print(f"  nvme {' ':32s}  {int(v)//1000:>3} °C")
+
+
+def cmd_fan(_: argparse.Namespace) -> None:
+    hwm = _find_acer_hwmon()
+    if hwm is None:
+        die("acer hwmon not found; is acer-wmi loaded?")
+    found = False
+    for i, (_short, descr) in ACER_HWMON_FANS.items():
+        v = _read_first_line(hwm / f"fan{i}_input")
+        if v:
+            print(f"fan{i}  {descr:30s}  {int(v):>5} rpm")
+            found = True
+    if not found:
+        die(f"no fan*_input under {hwm}")
+
+
+def cmd_profile_save(args: argparse.Namespace) -> None:
+    dev = find_device()
+    snapshot: dict[str, object] = {
+        k: read_text_attr(dev, k) for k in PROFILE_KEYS
+    }
+    frame_path = dev / "frame"
+    if frame_path.exists():
+        try:
+            frame = frame_path.read_bytes()
+            if len(frame) == PERKEY_BYTES:
+                snapshot["frame_hex"] = frame.hex()
+        except OSError:
+            pass
+    # Create + chown the directory tree to the invoking user (handles sudo).
+    parts = []
+    p = PROFILE_DIR
+    while not p.exists() and p != p.parent:
+        parts.append(p); p = p.parent
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    for created in reversed(parts):
+        _chown_to_invoker(created)
+    out = PROFILE_DIR / f"{args.name}.json"
+    out.write_text(json.dumps(snapshot, indent=2, sort_keys=True))
+    _chown_to_invoker(out)
+    print(f"saved {out}")
+
+
+def cmd_profile_load(args: argparse.Namespace) -> None:
+    src = PROFILE_DIR / f"{args.name}.json"
+    if not src.exists():
+        die(f"profile not found: {src}")
+    snap = json.loads(src.read_text())
+
+    # Power profile policy is global, not tied to a single RGB profile.
+    # The restore service loads the 'default' profile at login, so
+    # piggyback the AC/battery power-profile restore here. Best-effort:
+    # a failure (no acer-wmi, no permission) must not block the RGB
+    # restore below.
+    if args.name == DEFAULT_PROFILE_NAME:
+        try:
+            _apply_power_policy(verbose=True)
+        except Exception as e:
+            sys.stderr.write(f"power-policy apply skipped: {e}\n")
+
+    # Restore lightbar FIRST, independently of the keyboard half. The
+    # restore service runs at session start and the keyboard may not
+    # have enumerated by then (USB warm-up), but the WMBH lightbar
+    # path is bound to the WMI device which IS up. Doing lightbar
+    # first guarantees the bar comes back even if the keyboard half
+    # bails below.
+    _restore_lightbar_from_snap(snap)
+
+    try:
+        dev = find_device()
+    except SystemExit:
+        # No keyboard found — common if the venator module is
+        # mid-rebuild, the USB device is still warming up, or this is
+        # a desktop without the gaming keyboard. Lightbar already
+        # restored above; that's all we can do.
+        sys.stderr.write(
+            "profile load: no keyboard sysfs (yet); "
+            "lightbar half restored, keyboard half skipped\n")
+        return
+    stop_background()
+
+    try:
+        timeout = int(snap.get("timeout", DEFAULT_TIMEOUT_S))
+    except (TypeError, ValueError):
+        timeout = DEFAULT_TIMEOUT_S
+    if not (0 <= timeout <= TIMEOUT_MAX_S):
+        timeout = DEFAULT_TIMEOUT_S
+
+    # Animation-typed profile: respawn the animator.
+    anim = snap.get("animation_name")
+    if anim:
+        # Brightness is stored as a sysfs string ("200"); coerce to int.
+        try:
+            b = int(snap.get("brightness", "")) if snap.get("brightness") else None
+        except ValueError:
+            b = None
+        # First push the static fields too so brightness etc. land before
+        # the animator's first frame.
+        if b is not None:
+            write_text_attr(dev, "brightness", str(b))
+        start_animator(anim, b, timeout)
+        print(f"resumed animation '{anim}' (timeout={timeout}s)")
+        return
+
+    # Static-typed profile: restore the frame + mode + brightness.
+    if "frame_hex" in snap:
+        try:
+            write_bin_attr(dev, "frame", bytes.fromhex(snap["frame_hex"]))
+        except ValueError:
+            pass
+    for k in PROFILE_KEYS:
+        v = snap.get(k)
+        if v:
+            try:
+                write_text_attr(dev, k, str(v))
+            except (PermissionError, OSError) as e:
+                sys.stderr.write(f"profile load: skip {k}: {e}\n")
+    try:
+        commit(dev)
+    except (PermissionError, OSError) as e:
+        sys.stderr.write(f"profile load: commit failed: {e}\n")
+    # Spawn a keepalive worker honouring the saved timeout. With
+    # timeout=0 it runs forever; otherwise it exits + turns off LEDs at
+    # the deadline.
+    if snap.get("mode") not in (None, "off"):
+        start_keepalive(timeout)
+
+
+def _restore_lightbar_from_snap(snap: dict) -> None:
+    """Replay the saved lightbar state into the kernel.
+
+    Retries on PermissionError because the systemd restore service can
+    fire faster than udev applies the chgrp+chmod from
+    70-venator.rules. Half a second of retry is enough.
+    """
+    lb = snap.get("lightbar")
+    if not isinstance(lb, dict):
+        return
+    if not PREDATOR_LIGHTBAR_DIR.exists():
+        sys.stderr.write("lightbar restore: /sys/class/predator/lightbar0 not present "
+                         "(venator not loaded yet?); skipping\n")
+        return
+    mode_name = (lb.get("mode") or "").strip().lower()
+    if mode_name not in LB_MODE_IDS:
+        sys.stderr.write(f"lightbar restore: unknown saved mode {mode_name!r}; skipping\n")
+        return
+    mode_id = LB_MODE_IDS[mode_name]
+    try:
+        bright = int(lb.get("brightness") or 100)
+    except (TypeError, ValueError):
+        bright = 100
+    try:
+        speed = int(lb.get("speed") or 5)
+    except (TypeError, ValueError):
+        speed = 5
+    hex_color = (lb.get("color") or "ff0000").strip().lstrip("#")
+    try:
+        r = int(hex_color[0:2], 16)
+        g = int(hex_color[2:4], 16)
+        b = int(hex_color[4:6], 16)
+    except (ValueError, IndexError):
+        r, g, b = 0xff, 0, 0
+
+    payload = f"{mode_id} {bright} {speed} {r} {g} {b}"
+    target = PREDATOR_LIGHTBAR_DIR / "set"
+    # Retry loop to ride out the udev → chgrp race on cold boot.
+    last_err = None
+    for attempt in range(10):
+        try:
+            target.write_text(payload)
+            sys.stderr.write(f"lightbar restore: applied {payload}\n")
+            return
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.1)
+        except OSError as e:
+            last_err = e
+            break
+    sys.stderr.write(f"lightbar restore: failed after retries: {last_err}\n")
+
+
+def cmd_profile_show(args: argparse.Namespace) -> None:
+    """Print the JSON contents of a saved profile — useful for
+    verifying the lightbar half was actually captured.
+    """
+    src = PROFILE_DIR / f"{args.name}.json"
+    if not src.exists():
+        die(f"profile not found: {src}")
+    print(src.read_text(), end="")
+
+
+def cmd_profile_list(_: argparse.Namespace) -> None:
+    if not PROFILE_DIR.exists():
+        return
+    for p in sorted(PROFILE_DIR.glob("*.json")):
+        print(p.stem)
+
+
+def cmd_profile_delete(args: argparse.Namespace) -> None:
+    p = PROFILE_DIR / f"{args.name}.json"
+    if not p.exists():
+        die(f"profile not found: {p}")
+    p.unlink()
+    print(f"deleted {p}")
+
+
+# ------------------------------------------------------------------ main
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="venator")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="show device state").set_defaults(func=cmd_status)
+
+    # ---- rgb high-level (all auto-apply)
+    rgb = sub.add_parser("rgb", help="LED control").add_subparsers(dest="rgb_cmd", required=True)
+
+    rs = rgb.add_parser("static", help="solid colour, every key the same")
+    rs.add_argument("color", help="#RRGGBB")
+    rs.add_argument("--brightness", type=int)
+    _add_timeout_arg(rs)
+    rs.set_defaults(func=cmd_rgb_static)
+
+    re_ = rgb.add_parser("effect", help="run a named effect")
+    re_.add_argument("name", help=f"one of: {' '.join(m for m in MODES if m not in ('off','static','perkey'))}")
+    re_.add_argument("--color")
+    re_.add_argument("--brightness", type=int)
+    _add_timeout_arg(re_)
+    re_.set_defaults(func=cmd_rgb_effect)
+
+    rfill = rgb.add_parser("fill", help="per-key buffer: every key the same colour")
+    rfill.add_argument("color", help="#RRGGBB")
+    rfill.add_argument("--brightness", type=int)
+    _add_timeout_arg(rfill)
+    rfill.set_defaults(func=cmd_rgb_fill)
+
+    rpk = rgb.add_parser("perkey", help="per-key buffer from hex or file (384 bytes RGB)")
+    rpk.add_argument("data",
+                     help="384-byte raw file, hex string of 768 chars, or @path/to/file")
+    rpk.add_argument("--brightness", type=int)
+    _add_timeout_arg(rpk)
+    rpk.set_defaults(func=cmd_rgb_perkey)
+
+    ri = rgb.add_parser("image", help="paint a PNG / JPG / etc. across the 128 cells (needs Pillow)")
+    ri.add_argument("path", help="path to image file")
+    ri.add_argument("--brightness", type=int)
+    _add_timeout_arg(ri)
+    ri.set_defaults(func=cmd_rgb_image)
+
+    rd = rgb.add_parser("design", help="apply a one-shot static design (.json or .py)")
+    rd.add_argument("name", nargs="?", help="design name (or path/to/file)")
+    rd.add_argument("--list", action="store_true", help="list installed designs and exit")
+    rd.add_argument("--brightness", type=int)
+    _add_timeout_arg(rd)
+    rd.set_defaults(func=cmd_rgb_design)
+
+    rk = rgb.add_parser("key", help="paint one named key (requires a keymap)")
+    rk.add_argument("name", help="key name as recorded by `map discover`")
+    rk.add_argument("color", help="#RRGGBB")
+    rk.add_argument("--brightness", type=int)
+    _add_timeout_arg(rk)
+    rk.set_defaults(func=cmd_rgb_key)
+
+    rks = rgb.add_parser("keys", help="paint several named keys at once")
+    rks.add_argument("names", help="comma-separated key names, e.g. 'W,A,S,D'")
+    rks.add_argument("color", help="#RRGGBB")
+    rks.add_argument("--brightness", type=int)
+    _add_timeout_arg(rks)
+    rks.set_defaults(func=cmd_rgb_keys)
+
+    ra = rgb.add_parser("animate", help="run a custom animation script")
+    ra.add_argument("name", nargs="?", help="animation name (or path/to/file.py)")
+    ra.add_argument("--list", action="store_true", help="list installed animations and exit")
+    ra.add_argument("--brightness", type=int)
+    _add_timeout_arg(ra)
+    ra.set_defaults(func=cmd_rgb_animate)
+
+    rgb.add_parser("off", help="turn LEDs off").set_defaults(func=cmd_rgb_off)
+
+    # ---- low-level (stage; --apply to commit)
+    def low(parser_):
+        parser_.add_argument("--apply", action="store_true",
+                             help="commit immediately (otherwise stage only)")
+
+    pm = sub.add_parser("mode", help="set mode (low-level; stages only)")
+    pm.add_argument("name")
+    low(pm); pm.set_defaults(func=cmd_mode)
+
+    pc = sub.add_parser("color", help="set colour (low-level; stages only)")
+    pc.add_argument("color", help="#RRGGBB")
+    low(pc); pc.set_defaults(func=cmd_color)
+
+    pb = sub.add_parser("brightness", help="set brightness 0..255 (low-level; stages only)")
+    pb.add_argument("value", type=int)
+    low(pb); pb.set_defaults(func=cmd_brightness)
+
+    pe = sub.add_parser("effect-id", help="raw EFF byte override 0..255 (0 = use mode default)")
+    pe.add_argument("value", type=lambda s: int(s, 0))
+    low(pe); pe.set_defaults(func=cmd_effect_id)
+
+    sub.add_parser("apply", help="commit pending state").set_defaults(func=cmd_apply)
+
+    # ---- keymap
+    mp = sub.add_parser("map", help="manage the cell -> physical-key map").add_subparsers(dest="map_cmd", required=True)
+
+    md = mp.add_parser("discover",
+                       help="walk the 128 cells one by one; record the physical key for each")
+    md.add_argument("--start", type=int, default=0, help="first cell to discover")
+    md.add_argument("--end",   type=int, default=128, help="one past the last cell")
+    md.set_defaults(func=cmd_map_discover)
+
+    ms = mp.add_parser("show", help="show the current keymap")
+    ms.add_argument("--path", help="path to a keymap JSON (default: ~/.config/venator/keymap.json)")
+    ms.set_defaults(func=cmd_map_show)
+
+    mu = mp.add_parser("unset", help="remove a key mapping")
+    mu.add_argument("name")
+    mu.set_defaults(func=cmd_map_unset)
+
+    # ---- profiles
+    prof = sub.add_parser("profile", help="save / load named profiles").add_subparsers(dest="prof_cmd", required=True)
+
+    ps = prof.add_parser("save"); ps.add_argument("name"); ps.set_defaults(func=cmd_profile_save)
+    pl = prof.add_parser("load"); pl.add_argument("name"); pl.set_defaults(func=cmd_profile_load)
+    prof.add_parser("list").set_defaults(func=cmd_profile_list)
+    pd = prof.add_parser("delete"); pd.add_argument("name"); pd.set_defaults(func=cmd_profile_delete)
+    psh = prof.add_parser("show",
+        help="print the JSON of a saved profile (debug)")
+    psh.add_argument("name"); psh.set_defaults(func=cmd_profile_show)
+
+    # ---- power / thermal / battery (mainline acer-wmi wrappers)
+    pw = sub.add_parser("power", help="get/set the laptop power profile "
+                        "(quiet / balanced / performance / turbo / ...)")
+    pw.add_argument("name", nargs="?",
+                    help="profile name or alias (omit to print current + choices)")
+    pw.add_argument("--detach-ppd", action="store_true",
+                    help="mask EVERY active power manager (power-profiles-daemon, "
+                         "tuned, auto-cpufreq, …) so none re-apply their own "
+                         "profile on AC plug/unplug")
+    pw.add_argument("--attach-ppd", action="store_true",
+                    help="undo --detach-ppd (unmask + start whatever was masked)")
+    pw.set_defaults(func=cmd_power)
+
+    # Auto-link RGB scheme to power profile. Mapping kept in
+    # ~/.config/venator/power-rgb.json; consulted on every
+    # successful `power <profile>` call.
+    pr = sub.add_parser(
+        "power-rgb",
+        help="link an RGB colour scheme to each power profile (turbo=red, "
+        "balanced=white, etc.) so `power <profile>` also retints the keyboard",
+    ).add_subparsers(dest="prgb_cmd", required=True)
+    prs = pr.add_parser("set",
+                        help="map a profile to a colour applied on profile-switch")
+    prs.add_argument("profile",
+                     help="profile name or alias (low-power/quiet/balanced/"
+                     "performance/turbo or the raw kernel name)")
+    prs.add_argument("color", help="#RRGGBB")
+    prs.set_defaults(func=cmd_power_rgb_set)
+
+    pru = pr.add_parser("unset", help="remove a profile->colour mapping")
+    pru.add_argument("profile")
+    pru.set_defaults(func=cmd_power_rgb_unset)
+
+    pr.add_parser("list", help="show all profile->colour mappings + on/off state"
+                  ).set_defaults(func=cmd_power_rgb_list)
+
+    pr_en = pr.add_parser("enable",
+                          help="enable auto-RGB on profile change (default ON after set)")
+    pr_en.set_defaults(func=cmd_power_rgb_toggle, cmd_action="enable")
+    pr_di = pr.add_parser("disable",
+                          help="disable auto-RGB; mappings remain stored")
+    pr_di.set_defaults(func=cmd_power_rgb_toggle, cmd_action="disable")
+
+    pr.add_parser("apply",
+                  help="force-apply the colour for the current profile NOW "
+                       "(ignores global enable flag; useful for testing)"
+                  ).set_defaults(func=cmd_power_rgb_apply)
+
+    # Per-source power policy: separate profile for AC vs battery,
+    # restored at login by the restore service. Stored in
+    # ~/.config/venator/power-policy.json.
+    ppol = sub.add_parser(
+        "power-policy",
+        help="set per-source power profiles (AC vs battery) that are "
+             "restored at login; battery is limited to eco/quiet/balanced "
+             "unless --advanced",
+    )
+    ppol_sub = ppol.add_subparsers(dest="ppol_cmd")
+    ppol.set_defaults(func=cmd_power_policy)   # no subcommand → show
+
+    ppol_ac = ppol_sub.add_parser("ac", help="set the on-AC profile (any profile)")
+    ppol_ac.add_argument("profile",
+                         help="profile name or alias (eco/quiet/balanced/"
+                              "performance/turbo or the raw kernel name)")
+    ppol_ac.set_defaults(func=cmd_power_policy_set, slot="ac")
+
+    ppol_bat = ppol_sub.add_parser("battery",
+                                   help="set the on-battery profile "
+                                        "(eco/quiet/balanced; --advanced for more)")
+    ppol_bat.add_argument("profile",
+                          help="eco / quiet / balanced (performance / turbo "
+                               "need --advanced)")
+    ppol_bat.add_argument("--advanced", action="store_true",
+                          help="allow performance/turbo on battery "
+                               "(degrades battery health)")
+    ppol_bat.set_defaults(func=cmd_power_policy_set, slot="battery")
+
+    ppol_sub.add_parser("apply",
+                        help="apply the profile for the current power source "
+                             "now (used by the restore service at login)"
+                        ).set_defaults(func=cmd_power_policy_apply)
+    ppol_sub.add_parser("show",
+                        help="show the current policy + power source"
+                        ).set_defaults(func=cmd_power_policy)
+    ppol_sub.add_parser("clear", help="delete the stored policy"
+                        ).set_defaults(func=cmd_power_policy_clear)
+
+    # Long-running daemon that re-applies the policy on AC plug/unplug so
+    # the profile changes in real time. Run by the powerwatch user unit.
+    pwatch = sub.add_parser(
+        "power-watch",
+        help="daemon: re-apply the AC/battery policy whenever the charger "
+             "is plugged in or unplugged (run by the powerwatch service)")
+    pwatch.add_argument("--interval", type=float, default=2.0,
+                        help="seconds between AC-state polls (default 2.0)")
+    pwatch.add_argument("--settle", type=float, default=1.0,
+                        help="seconds to wait after a change before applying, "
+                             "so we land after any other daemon (default 1.0)")
+    pwatch.set_defaults(func=cmd_power_watch)
+
+    bat = sub.add_parser("battery",
+                         help="battery info / charge limit / behaviour"
+                         ).add_subparsers(dest="bat_cmd", required=True)
+
+    bat.add_parser("info", help="dump battery state").set_defaults(func=cmd_battery_info)
+
+    bl = bat.add_parser("limit",
+                        help="get/set the charge-stop limit (PH16-71 firmware "
+                        "supports 80%% cap on/off; other boards may take any percent)")
+    bl.add_argument("value", nargs="?",
+                    help="'on' / 'off' / 1..100 (omit to read the current limit)")
+    bl.set_defaults(func=cmd_battery_limit)
+
+    bb = bat.add_parser("behaviour",
+                        help="get/set charge_behaviour (auto / inhibit-charge / ...)")
+    bb.add_argument("name", nargs="?")
+    bb.set_defaults(func=cmd_battery_behaviour)
+
+    misc = sub.add_parser(
+        "misc",
+        help="LCD overdrive, boot sound, etc — gaming-misc toggles via WMBH "
+             "(needs /sys/class/predator/gaming0 from the kernel module)")
+    misc.add_argument("feature", nargs="?",
+                      help=f"one of: {', '.join(sorted(_MISC_ATTRS))} "
+                           "(omit to dump status of all)")
+    misc.add_argument("value", nargs="?",
+                      help="on/off (omit to read current state of one feature)")
+    misc.set_defaults(func=cmd_misc)
+
+    # ---- lightbar (rear 3-zone EC RGB strip on PH16-71) ------------
+    lb = sub.add_parser(
+        "lightbar",
+        help="rear lightbar control (needs /sys/class/predator/lightbar0 "
+             "from the kernel module). Modes: " + ", ".join(LB_MODES),
+        description=(
+            "Control the Predator rear lightbar via the WMBH AcerGamingFunction\n"
+            "WMI method (decoded from AcerECLightbarController.dll). Use the\n"
+            "atomic 'set' form for the common case — one WMI call updates\n"
+            "everything at once. Individual mode/color/brightness/speed\n"
+            "subcommands are equivalent but each does its own commit."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    lbs = lb.add_subparsers(dest="lb_cmd", required=True)
+
+    lbs.add_parser("status",
+                   help="dump current mode/color/brightness/speed"
+                   ).set_defaults(func=cmd_lightbar_status)
+
+    lbs.add_parser("off",
+                   help="turn the lightbar off"
+                   ).set_defaults(func=cmd_lightbar_off)
+
+    lbs.add_parser("modes",
+                   help="list available modes"
+                   ).set_defaults(func=cmd_lightbar_modes)
+
+    lbs.add_parser("apply",
+                   help="re-commit the kernel-cached state (no value change)"
+                   ).set_defaults(func=cmd_lightbar_apply)
+
+    lbw = lbs.add_parser(
+        "wake",
+        help="recover a stuck-off lightbar by replaying the breathing→"
+             "<target> init sequence the firmware needs after a reset")
+    lbw.add_argument("--mode", default="static",
+                     help="final mode to leave the bar in (default: static)")
+    lbw.set_defaults(func=cmd_lightbar_wake)
+
+    lbm = lbs.add_parser("mode", help="set the effect mode")
+    lbm.add_argument("name", help="one of: " + ", ".join(LB_MODES))
+    lbm.set_defaults(func=cmd_lightbar_mode)
+
+    lbc = lbs.add_parser("color", help="set RGB colour")
+    lbc.add_argument("color", help="RRGGBB hex (e.g. ff0000 for red)")
+    lbc.set_defaults(func=cmd_lightbar_color)
+
+    lbb = lbs.add_parser("brightness", help="set brightness 0..255")
+    lbb.add_argument("value", type=int)
+    lbb.set_defaults(func=cmd_lightbar_brightness)
+
+    lbsp = lbs.add_parser("speed", help="set animation speed 0..255")
+    lbsp.add_argument("value", type=int)
+    lbsp.set_defaults(func=cmd_lightbar_speed)
+
+    lbset = lbs.add_parser(
+        "set",
+        help="atomic update — one WMI call updates all fields at once "
+             "(unset fields keep their current value)")
+    lbset.add_argument("--mode",
+                       help="one of: " + ", ".join(LB_MODES))
+    lbset.add_argument("--color",
+                       help="RRGGBB hex colour")
+    lbset.add_argument("--brightness", type=int,
+                       help="0..255 brightness")
+    lbset.add_argument("--speed", type=int,
+                       help="0..255 animation speed")
+    lbset.set_defaults(func=cmd_lightbar_set)
+
+    # Per-zone colour was attempted via WMBH method 6 (SetGamingRgbKb)
+    # but the firmware on PH16-71 rejects every input combination we
+    # tested, so it is not exposed. If a future chassis turns out to
+    # support it, a `zone-color` subcommand can be added here.
+
+    lba = lbs.add_parser(
+        "anim",
+        help="run a lightbar animation (foreground; Ctrl-C to stop). "
+             "Pass 'list' to see what's available.")
+    lba.add_argument("name",
+                     help="animation name (without .py), an absolute "
+                          "path to a .py file, or 'list'")
+    lba.add_argument("--timeout", type=int, default=0,
+                     help="stop after N seconds (0 = run forever)")
+    lba.set_defaults(func=cmd_lightbar_anim)
+
+    # ---- unified themes (keyboard + lightbar coordinated) --------------
+    uni = sub.add_parser(
+        "unified",
+        help="apply a synchronised keyboard+lightbar theme in one shot. "
+             "Themes are JSON files under cli/designs/unified/ and "
+             "~/.config/venator/designs/unified/."
+    ).add_subparsers(dest="uni_cmd", required=True)
+
+    uni.add_parser(
+        "list", help="list built-in + user unified themes"
+    ).set_defaults(func=cmd_unified_list)
+
+    ua = uni.add_parser("apply", help="apply a unified theme to both")
+    ua.add_argument("name",
+                    help="theme name (without .json) or absolute path")
+    ua.add_argument("--timeout", type=parse_timeout, default=None,
+                    help="auto-off after N seconds (applies to keyboard half)")
+    ua.set_defaults(func=cmd_unified_apply)
+
+    us = uni.add_parser(
+        "save", help="snapshot the current state into a new unified theme")
+    us.add_argument("name", help="theme name (used as filename)")
+    us.add_argument("--description", default=None)
+    us.set_defaults(func=cmd_unified_save)
+
+    una = uni.add_parser(
+        "anim",
+        help="run a synchronized keyboard+lightbar animation "
+             "(foreground; Ctrl-C to stop). Pass 'list' to see available.")
+    una.add_argument("name",
+                     help="animation name (without .py), an absolute "
+                          "path to a .py file, or 'list'")
+    una.add_argument("--timeout", type=int, default=0,
+                     help="stop after N seconds (0 = run forever)")
+    una.set_defaults(func=cmd_unified_anim)
+
+    # ---- TUI launcher --------------------------------------------------
+    tp = sub.add_parser(
+        "tui",
+        help="launch the Textual TUI (live keyboard preview + lightbar + "
+             "power + battery tabs)")
+    tp.add_argument("tui_args", nargs=argparse.REMAINDER,
+                    help="extra args passed through to tui.py")
+    tp.set_defaults(func=cmd_tui)
+
+    sub.add_parser(
+        "thermal",
+        help="dump fan RPMs + CPU/GPU/chassis/nvme temps",
+        description=(
+            "Dumps the acer-wmi hwmon device (mainline doesn't label its "
+            "inputs, so we relabel them):\n"
+            "  fan1   = left  blower (CPU side)         (EC codename CPUF/EFAN)\n"
+            "  fan2   = right blower (GPU side)         (EC codename GPUF)\n"
+            "  temp1  = CPU package sensor              (EC codename CTMP)\n"
+            "  temp2  = GPU sensor — 0 when dGPU sleeps (EC codename GTMP)\n"
+            "  temp3  = chassis / palmrest ambient       (EC codename STMP)\n"
+            "\n"
+            "Also pulls coretemp's CPU package and the nvme composite for "
+            "cross-checking (acer/temp1 reads via EC; coretemp reads MSRs "
+            "directly off the die, so they should agree within ~2 °C)."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    ).set_defaults(func=cmd_thermal)
+
+    sub.add_parser(
+        "fan",
+        help="dump fan RPMs only",
+        description=(
+            "Fan RPMs from the acer-wmi hwmon device:\n"
+            "  fan1 = left  blower (CPU side, EC fan tach 0x00..0x07)\n"
+            "  fan2 = right blower (GPU side, EC fan tach 0x10..0x17)"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    ).set_defaults(func=cmd_fan)
+
+    # Hidden internal subcommand used by start_animator() / start_keepalive()
+    # to run loops in the detached child. Not for user invocation.
+    rl = sub.add_parser("_run-loop", help=argparse.SUPPRESS)
+    rlg = rl.add_mutually_exclusive_group(required=True)
+    rlg.add_argument("--anim",      help=argparse.SUPPRESS)
+    rlg.add_argument("--keepalive", action="store_true", help=argparse.SUPPRESS)
+    rl.add_argument("--brightness", type=int, help=argparse.SUPPRESS)
+    rl.add_argument("--timeout",    type=int, default=0, help=argparse.SUPPRESS)
+    rl.set_defaults(func=cmd__run_loop)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

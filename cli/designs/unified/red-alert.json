@@ -1,0 +1,15 @@
+{
+  "name": "red-alert",
+  "description": "all hands on deck: static red on both keyboard and lightbar",
+  "keyboard": {
+    "mode": "static",
+    "color": "#ff0000",
+    "brightness": 220
+  },
+  "lightbar": {
+    "mode": "static",
+    "color": "#ff0000",
+    "brightness": 220,
+    "speed": 5
+  }
+}

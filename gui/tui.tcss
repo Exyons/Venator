@@ -1,0 +1,230 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * App-level styling for the venator TUI (PredatorSenseApp).
+ * Loaded via `CSS_PATH = "tui.tcss"`. Per-widget styling stays in each
+ * widget's DEFAULT_CSS in tui_widgets.py. */
+
+Screen { layout: vertical; }
+
+/* Slim live-status strip that sits just above the key-hint Footer. */
+#livestat {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+    color: $text-muted;
+    text-align: right;
+}
+
+#kbview  {
+    height: auto;
+    padding: 0;
+    margin: 0;
+}
+TabbedContent { height: 1fr; margin-top: 0; }
+/* Every tab scrolls vertically when its content is taller than the
+ * viewport, so nothing is ever clipped on short terminals. */
+TabPane       { padding: 0 1; overflow-y: auto; overflow-x: hidden; }
+
+/* Inner TabbedContent inside the Keyboard tab — pin to remaining
+ * space below the global controls + preview. */
+#kb_inner { height: 1fr; }
+
+.row     { height: auto; padding: 0 1; }
+.row Label { width: 14; padding: 1 0 0 0; }
+Input    { width: 28; }
+.globals Input { width: 8; margin-right: 2; }
+.globals Label { width: auto; padding: 1 0 0 0; margin-right: 1; }
+.globals Button { margin-left: 2; }
+
+/* Lightbar tab inputs. The default `.globals Input { width: 8 }`
+ * is too narrow for the RRGGBB hex colour (6 chars + 2 for cursor +
+ * room for type-back). Numeric inputs (brightness / speed) only
+ * need 3 chars so we give them width 6 to look uniform. Padding 0
+ * tightens the row — the default Input has 1 char internal
+ * left/right padding on top of the border which made the field
+ * look puny relative to its 3-line height. */
+.lb-row        { height: auto; padding: 0 1; }
+.lb-row Label  { width: auto; padding: 1 0 0 0; margin-right: 1; }
+.lb-row Input  { padding: 0 1; margin-right: 2; }
+.lb-row Button { margin-left: 2; }
+.lb-color      { width: 12; }   /* RRGGBB + cursor + breathing room */
+.lb-num        { width: 9; }    /* 3 digits + spinner padding */
+
+/* Tighter button row spacing — earlier rev had `padding: 1 0` on
+ * .btn-row which double-padded above + below every button group
+ * (visible as a 1-line gap between the Effects/Designs grids and
+ * whatever followed). 0-pad top, 1-pad below = just enough
+ * breathing room without wasted vertical real estate. */
+/* Action rows share width evenly (1fr) so buttons in a row are
+ * uniform, with a cap so a 2-button row doesn't grow giant buttons. */
+.btn-row { height: auto; margin: 1 0 0 0; padding: 0; }
+.btn-row Button { width: 1fr; max-width: 28; margin: 0 1 0 0; }
+
+/* Subsection labels inside panels (e.g. "On AC power:") need air above
+ * them so they don't collide with the grid that precedes them. */
+.subhead { padding: 1 1 0 1; color: $foreground; text-style: bold; }
+
+/* Slider rows: fixed-width label + full-width track on ONE line, so the
+ * label and the 1-tall slider sit on the same row (a 3-tall input row
+ * would otherwise float the slider above its label). */
+.slider-row { height: 1; padding: 0 1; margin: 1 0 0 0; }
+.slider-row Label { width: 14; padding: 0; color: $foreground; }
+.slider-row Slider { width: 1fr; }
+
+ButtonGrid { padding: 0 1; margin: 1 0 0 0; }
+ButtonGrid Button { margin-bottom: 0; }
+
+/* Power tab: two side-by-side columns. Left scrolls so its stack of
+ * button grids is never clipped; right holds the live fans/temps. */
+#pwr_columns { height: 1fr; }
+.pwr-col     { width: 1fr; height: 1fr; padding: 0 1; }
+#pwr_col_left  { border-right: solid $panel; }
+/* These grids must size to their content, NOT grab 1fr each — three
+ * 1fr grids stacked in one column squashed every button to 1 row
+ * tall (the "cramped" bug). */
+#pwr_grid, #ppol_ac_grid, #ppol_bat_grid { height: auto; }
+
+.fans-row { height: auto; padding: 0 1; }
+.fans-row FanSpinner { margin-right: 2; }
+
+.small    { color: $text-muted; padding: 0 1; }
+/* Section headers read as neon-cyan rules across every tab. */
+.section  { color: $secondary; text-style: bold; padding: 1 1 0 1; }
+
+/* ---------------------------------------------------------------------
+ * Neon Predator: Home dashboard. Gradient banner (NeonBanner colours
+ * itself), centred tagline, then a 2x2 grid of heavy-bordered status
+ * cards. Each card gets its own accent colour from the active theme so
+ * the four read as distinct without hard-coding hexes here. */
+#home_banner {
+    height: auto;
+    content-align: center top;
+    padding: 1 0 0 0;
+}
+.tagline {
+    height: auto;
+    content-align: center middle;
+    color: $accent;
+    text-style: italic bold;
+    padding: 1 0;
+}
+#home_cards {
+    grid-size: 2 2;
+    grid-gutter: 1 2;
+    grid-rows: auto;
+    height: auto;
+    padding: 0 2 1 2;
+}
+.neon-card {
+    height: auto;
+    min-height: 6;
+    padding: 1 2;
+    background: $surface;
+    border: heavy $primary;
+    border-title-color: $primary;
+    border-title-style: bold;
+    border-title-align: left;
+    transition: tint 220ms linear;
+}
+/* Hovering a card lifts it with a faint accent wash. */
+.neon-card:hover { tint: $primary 12%; }
+.card-kbd { border: heavy $primary;   border-title-color: $primary;   }
+.card-pwr { border: heavy $warning;   border-title-color: $warning;   }
+.card-bat { border: heavy $success;   border-title-color: $success;   }
+.card-lb  { border: heavy $secondary; border-title-color: $secondary; }
+
+/* ---------------------------------------------------------------------
+ * Panel — the Home-card look reused as a section container in every tab.
+ * Heavy accent border, left-aligned bold title, surface fill, faint
+ * hover wash. Variants recolour the border/title from the theme. */
+.panel {
+    height: auto;
+    background: $surface;
+    border: heavy $primary;
+    border-title-color: $primary;
+    border-title-style: bold;
+    border-title-align: left;
+    padding: 1 2;
+    margin: 0 0 1 0;
+    transition: tint 220ms linear;
+}
+.panel:hover { tint: $primary 8%; }
+.panel-magenta { border: heavy $primary;   border-title-color: $primary;   }
+.panel-cyan    { border: heavy $secondary; border-title-color: $secondary; }
+.panel-amber   { border: heavy $warning;   border-title-color: $warning;   }
+.panel-green   { border: heavy $success;   border-title-color: $success;   }
+
+/* Tabs: roomy horizontal padding + high-contrast active label so the
+ * nav reads clearly instead of cramming the words together. */
+Tab {
+    padding: 0 3;
+    text-style: bold;
+    color: $text-muted;
+}
+Tab.-active { color: $primary; }
+Tabs:focus Tab.-active { color: $accent; }
+Underline > .underline--bar { color: $primary; }
+
+ListView { height: 1fr; border: round $secondary; }
+#profile_list { height: 1fr; }
+
+/* ---------------------------------------------------------------------
+ * Buttons — one uniform, legible system everywhere. Default (un-variant)
+ * buttons get a panel fill + accent border so they never disappear into
+ * the violet-black field. Focus is bold + accent border (no reverse
+ * video on the label); a press flashes the accent fill. Variant buttons
+ * keep their semantic colour. ButtonGrid overrides width/margin itself,
+ * so grid layouts are unaffected. */
+Button {
+    min-width: 14;
+    height: 3;
+    margin: 0 1 1 0;
+    color: $foreground;
+    background: $panel;
+    border: tall $primary-darken-2;
+    text-style: none;
+    /* Glow fades in on hover/press instead of snapping. */
+    transition: background 160ms in_out_cubic, color 120ms linear;
+}
+Button:hover   { background: $primary 25%; border: tall $primary; }
+Button:focus   { text-style: bold; border: tall $accent; }
+Button.-active { background: $primary; color: $background; border: tall $primary; }
+
+Button.-primary { background: $primary; color: $background; border: tall $primary; }
+Button.-success { background: $success; color: $background; border: tall $success; }
+Button.-warning { background: $warning; color: $background; border: tall $warning; }
+Button.-error   { background: $error;   color: $background; border: tall $error; }
+
+/* Colour-popup swatch chips. App-level (not popup DEFAULT_CSS) so they
+ * outrank the generic Button sizing — otherwise min-width:14 stretches
+ * each chip. Borderless + extra right margin so the pure colour reads
+ * cleanly and they aren't cramped together. */
+ColorPopup .chip {
+    width: 7; min-width: 4; height: 3;
+    margin: 0 2 1 0; padding: 0; border: none;
+}
+ColorPopup .chip:hover { border: none; }
+
+/* Popup input sizing must also be app-level so it beats the generic
+ * `Input { width: 28 }` rule (which otherwise stretches the R/G/B fields
+ * and clips two of them off the row). */
+ColorPopup #popup_input { width: 1fr; }
+ColorPopup .rgb Input { width: 10; margin-right: 1; }
+
+/* Info buttons: a quiet cyan pill, distinct from action buttons. */
+.info-btn {
+    min-width: 10; width: auto; height: 3;
+    background: $surface; border: tall $secondary; color: $secondary;
+}
+/* Icon-only buttons (e.g. the lightbar colour-picker swatch trigger). */
+.icon-btn { min-width: 6; width: 6; }
+
+/* Battery BATTERY panel: capacity hero + pack table side-by-side so the
+ * panel width isn't half-empty. */
+.bat-cols { height: auto; }
+.bat-cols > #bat_capacity { width: 30; }
+.bat-cols > #bat_body { width: 1fr; padding-left: 2; }
+
+/* Battery tab: capacity hero + tabular details. */
+.bat-hero   { height: auto; padding: 1 1 0 1; }
+#bat_body   { height: auto; padding: 0 1; }
+.bat-health { height: auto; padding: 1 1 0 1; }
