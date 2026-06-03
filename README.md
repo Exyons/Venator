@@ -11,6 +11,8 @@ terminal UI, or systemd at login.
 > live switching), battery health limit, fans/thermals, profiles and
 > boot‑restore all work today. See the [Roadmap](#roadmap) for what's next.
 
+![tui-screenshot](./assets/tui.png)
+
 ---
 
 ## Table of contents
