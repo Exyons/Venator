@@ -32,17 +32,17 @@ from tui_common import parse_color
 NEON_START = "#ff2e97"
 NEON_END   = "#00e5ff"
 
-# Embedded "PREDATOR" wordmark in the ANSI-Shadow figlet style. Shipped
+# Embedded "VENATOR" wordmark in the ANSI-Shadow figlet style. Shipped
 # as a constant so the banner looks right with zero extra dependency
 # (pyfiglet is optional — see NeonBanner). Box-drawing only, so it
 # renders identically on any UTF-8 terminal.
-BANNER_PREDATOR = (
-    "██████╗ ██████╗ ███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗\n"
-    "██╔══██╗██╔══██╗██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗\n"
-    "██████╔╝██████╔╝█████╗  ██║  ██║███████║   ██║   ██║   ██║██████╔╝\n"
-    "██╔═══╝ ██╔══██╗██╔══╝  ██║  ██║██╔══██║   ██║   ██║   ██║██╔══██╗\n"
-    "██║     ██║  ██║███████╗██████╔╝██║  ██║   ██║   ╚██████╔╝██║  ██║\n"
-    "╚═╝     ╚═╝  ╚═╝╚══════╝╚═════╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝"
+BANNER_VENATOR = (
+    "██╗   ██╗███████╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ \n"
+    "██║   ██║██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗\n"
+    "██║   ██║█████╗  ██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝\n"
+    "╚██╗ ██╔╝██╔══╝  ██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗\n"
+    " ╚████╔╝ ███████╗██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║\n"
+    "  ╚═══╝  ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝"
 )
 
 
@@ -261,7 +261,7 @@ class ColorWheel(Static, can_focus=True):
 class NeonBanner(Static):
     """Big gradient wordmark for the Home tab.
 
-    Defaults to the embedded ANSI-Shadow "PREDATOR" art (no dependency).
+    Defaults to the embedded ANSI-Shadow "VENATOR" art (no dependency).
     Any other `text` uses pyfiglet when it's installed, else degrades to
     a plain bold gradient of the word so the TUI always runs.
     """
@@ -271,7 +271,7 @@ class NeonBanner(Static):
     SHIMMER_HZ = 12
     SHIMMER_SPEED = 0.18
 
-    def __init__(self, text: str = "PREDATOR", subtitle: str = "", *, id=None):
+    def __init__(self, text: str = "VENATOR", subtitle: str = "", *, id=None):
         super().__init__(id=id)
         self._text = text
         self._subtitle = subtitle
@@ -286,8 +286,8 @@ class NeonBanner(Static):
         self.refresh()
 
     def _art(self) -> str:
-        if self._text.upper() == "PREDATOR":
-            return BANNER_PREDATOR
+        if self._text.upper() == "VENATOR":
+            return BANNER_VENATOR
         try:
             from pyfiglet import Figlet
             return Figlet(font="ansi_shadow", width=200).renderText(

@@ -29,7 +29,7 @@ class HomeTabMixin:
 
     def _compose_home(self) -> ComposeResult:
         yield NeonBanner(
-            "PREDATOR",
+            "VENATOR",
             subtitle=f"  « glow harder »   {self.client.device_name().lower()} · armed",
             id="home_banner",
         )
