@@ -2540,13 +2540,20 @@ def _apply_keyboard_section(kb: dict, timeout: int) -> None:
                        stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=5)
         return
-    # Static / breathing / firmware effect mode.
-    args = [sys.argv[0], "rgb", "effect", mode]
-    if color:
-        args += ["--color", color]
-    args += ["--brightness", str(bright)]
-    if timeout > 0:
-        args += ["--timeout", str(timeout)]
+    if mode == "static":
+        # Static is its own command; `rgb effect` explicitly rejects it.
+        args = [sys.argv[0], "rgb", "static", "#" + (color or "ff0000"),
+                "--brightness", str(bright)]
+        if timeout > 0:
+            args += ["--timeout", str(timeout)]
+    else:
+        # Firmware effect (breathing / rainbow / snake / ...).
+        args = [sys.argv[0], "rgb", "effect", mode]
+        if color:
+            args += ["--color", color]
+        args += ["--brightness", str(bright)]
+        if timeout > 0:
+            args += ["--timeout", str(timeout)]
     try:
         subprocess.run(args, timeout=10)
     except Exception as e:

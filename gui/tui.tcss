@@ -153,6 +153,12 @@ ButtonGrid Button { margin-bottom: 0; }
 .panel-amber   { border: heavy $warning;   border-title-color: $warning;   }
 .panel-green   { border: heavy $success;   border-title-color: $success;   }
 
+/* Unified tab: the dynamically-populated scene-button box. Vertical
+ * defaults to height:1fr, which collapses inside the auto-height Panel
+ * and lets the mounted button rows overflow the bottom border. Force
+ * auto so the Panel grows to fit them. */
+#uni_buttons { height: auto; }
+
 /* Tabs: roomy horizontal padding + high-contrast active label so the
  * nav reads clearly instead of cramming the words together. */
 Tab {
