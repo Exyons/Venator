@@ -427,7 +427,7 @@ flowchart LR
 On the PH16‑71 the **keyboard LEDs hang off the keyboard MCU**
 (`04F2:0117`, Chicony) and are driven over USB‑HID, *not* the EC/WMI RGB
 path that the community modules (`Linuwu-Sense`,
-`acer-venator-turbo-and-rgb-keyboard-linux-module`) assume — which is
+`acer-predator-turbo-and-rgb-keyboard-linux-module`) assume — which is
 why those load cleanly but light nothing on this chassis. Commands are
 8‑byte HID feature reports; per‑key frames are 8×64‑byte interrupt‑OUT
 bursts (128 cells × `{0x00,R,G,B}`). The **rear lightbar** uses the EC
