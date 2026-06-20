@@ -21,6 +21,7 @@ terminal UI, or systemd at login.
 - [Supported hardware](#supported-hardware)
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Uninstall](#uninstall)
 - [Usage](#usage)
   - [Terminal UI](#terminal-ui)
   - [Keyboard RGB](#keyboard-rgb)
@@ -198,9 +199,28 @@ Full details in
 [`packaging/fedora/README.md`](packaging/fedora/README.md) and
 [`docs/INSTALL.md`](docs/INSTALL.md).
 
-Uninstall with `sudo ./install.sh --uninstall` (removes the kernel module,
-userspace, udev rule, systemd units, and the `venator` group). Per‑user data
-under `~/.config/venator/` is left intact; `sudo make purge` also removes it.
+## Uninstall
+
+One command removes everything `install.sh` set up — the kernel module, the
+userspace CLI + assets, the udev rule, the systemd units, the modules-load.d
+entry, and the `venator` group:
+
+```bash
+sudo ./install.sh --uninstall
+```
+
+On Fedora it also tears down the `kernel-install` hook and the staged sources
+at `/usr/src/venator/`.
+
+**Left in place:**
+
+- Per-user data under `~/.config/venator/` (profiles, keymap, custom
+  designs/animations) and `~/.cache/venator/`.
+- Signing keys at `/etc/pki/akmods/` and `/var/lib/sbctl/` (shared with other
+  packages).
+
+To also wipe the per-user data, run `sudo make purge`. (The `make` wrappers
+still work too: `sudo make uninstall` ≈ `./install.sh --uninstall`.)
 
 ## Usage
 
