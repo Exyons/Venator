@@ -468,7 +468,7 @@ anywhere.
 
 - The Acer Linux community, including
   [Linuwu‑Sense](https://github.com/0x7375646F/Linuwu-Sense) and
-  [acer‑venator‑turbo‑and‑rgb‑keyboard‑linux‑module](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module),
+  [acer‑predator‑turbo‑and‑rgb‑keyboard‑linux‑module](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module),
   for prior reverse‑engineering of the WMI paths.
 - [OpenRGB](https://openrgb.org/) — the SDK capture that revealed the
   lightbar's Static (Direct) mode.
