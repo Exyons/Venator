@@ -102,7 +102,7 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 - Optional: `python3-textual` for the TUI, `python3-pillow` for image
   painting.
 - The module is built **unsigned by default**. If **Secure Boot** enforces
-  module signatures, install with `SECUREBOOT=1` and enroll a key once (the
+  module signatures, install with `--secureboot` and enroll a key once (the
   installer walks you through it). See
   [With Secure Boot](#with-secure-boot).
 
@@ -112,18 +112,22 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 git clone https://github.com/Exyons/Venator.git
 cd Venator
 
-# 1) Userspace: CLI, assets, udev rule, systemd units, modules-load.d
-sudo make install
-
-# 2) Kernel module — auto-detects your distro and runs the right routine
-sudo make module-install
+# One command does everything: userspace (CLI, assets, udev rule, systemd
+# units, modules-load.d) + the kernel module for your distro.
+sudo ./install.sh
 ```
 
-`make module-install` reads `/etc/os-release` and picks the routine that
-fits your distro. **The module is built unsigned by default** (non-Secure
-Boot). If you run Secure Boot, add `SECUREBOOT=1` — see
+`install.sh` reads `/etc/os-release` and picks the routine that fits your
+distro, installs the userspace half, builds + loads the kernel module,
+creates the `venator` group, and enables the user services — all in one
+shot. **The module is built unsigned by default** (non-Secure Boot). If you
+run Secure Boot, add `--secureboot` — see
 [With Secure Boot](#with-secure-boot) below. To force a routine explicitly:
-`sudo make hook-install` (Fedora) or `sudo make manual-install` (Arch / any).
+`sudo ./install.sh --hook` (Fedora) or `sudo ./install.sh --manual` (Arch / any).
+
+> The `make` targets still work as thin wrappers — `sudo make module-install`
+> (= `./install.sh`), `hook-install`, `manual-install`, with `SECUREBOOT=1`
+> to sign — but `./install.sh` is the recommended single entry point.
 
 ### What runs on your distro
 
@@ -137,14 +141,14 @@ kernel, installs to `/lib/modules/$(uname -r)/extra/`, and loads it. CachyOS
 kernels are **Clang/LLD-built**, so the build switches to `LLVM=1`
 automatically (detected from `CONFIG_CC_IS_CLANG`) — building with GCC against
 a Clang kernel fails with `unrecognized command-line option '-mllvm'` and
-friends. **Re-run `sudo make manual-install` after each kernel upgrade** (a
+friends. **Re-run `sudo ./install.sh --manual` after each kernel upgrade** (a
 pacman hook for auto-rebuild is planned). Build deps:
 `sudo pacman -S --needed base-devel` + headers matching your kernel
 (e.g. `linux-cachyos-headers`, `linux-headers`); `clang lld llvm` if missing.
 
 ### Without Secure Boot (default)
 
-Nothing extra to do — `sudo make module-install` builds and loads an
+Nothing extra to do — `sudo ./install.sh` builds and loads an
 **unsigned** module. This is the right path when Secure Boot is off (and on
 CachyOS even with Secure Boot on, since its kernel doesn't enforce module
 signatures — `lockdown` is `none`). If Secure Boot *is* enforcing signatures,
@@ -153,10 +157,10 @@ Boot path below.
 
 ### With Secure Boot
 
-Add `SECUREBOOT=1` (equivalently, pass `--secureboot` to `install.sh`):
+Add `--secureboot` (or `SECUREBOOT=1` if you use the `make` wrapper):
 
 ```bash
-sudo make module-install SECUREBOOT=1
+sudo ./install.sh --secureboot
 ```
 
 This signs the module with an auto-detected key. The installer looks, in
@@ -173,15 +177,14 @@ order, for an **akmods** key (`/etc/pki/akmods/`), a **shim MOK**
   which the installer does for you.
 - **Custom keys (any distro)** — provide your own signing key explicitly with
   `--mok-priv PATH --mok-cert PATH` (these imply `--secureboot`). Useful if you
-  don't use sbctl/akmods or keep your MOK elsewhere. The `make` knob only does
-  auto-detection, so run `install.sh` directly for custom paths:
+  don't use sbctl/akmods or keep your MOK elsewhere:
   `sudo ./install.sh --manual --mok-priv ~/MOK.priv --mok-cert ~/MOK.der`
   (swap `--manual` for `--hook` on Fedora).
 
-If `SECUREBOOT=1` is set but no key can be found, the install aborts with
+If `--secureboot` is set but no key can be found, the install aborts with
 instructions rather than installing a module that won't load.
 
-`make install` also drops two **user** services and enables them for you:
+`install.sh` also drops two **user** services and enables them for you:
 `venator-restore` (restore at login) and
 `venator-powerwatch` (live AC/battery profile switching). A
 system `venator-perms` unit hands the relevant `/sys` entries to
@@ -195,9 +198,9 @@ Full details in
 [`packaging/fedora/README.md`](packaging/fedora/README.md) and
 [`docs/INSTALL.md`](docs/INSTALL.md).
 
-Uninstall with `sudo make uninstall` (per‑user data under
-`~/.config/venator/` is left intact) or `sudo make purge` to also
-remove it.
+Uninstall with `sudo ./install.sh --uninstall` (removes the kernel module,
+userspace, udev rule, systemd units, and the `venator` group). Per‑user data
+under `~/.config/venator/` is left intact; `sudo make purge` also removes it.
 
 ## Usage
 
