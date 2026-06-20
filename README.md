@@ -435,7 +435,7 @@ Planned / wanted — contributions very welcome:
 1. **Custom boot logo** — replace the BIOS splash image.
 2. **USB powered‑off charging** — toggle charging the USB‑A port while
    the laptop is asleep/off.
-3. **Per‑zone RGB control** — works in Windows but no working Linux WMI
+3. **Per‑zone Lightbar RGB control** — works in Windows but no working Linux WMI
    path has been found on the PH16‑71 yet.
 4. **Hosted documentation wiki** — move the deep docs to a browsable web
    wiki.
