@@ -91,6 +91,7 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 | -------- | --------- | ------------------------- | ---- |
 | PH16‑71  | Fedora 43 | `7.0.9-105.fc43.x86_64`   | 1.16 |
 | PH16‑71  | Fedora 43 | `7.0.10-101.fc43.x86_64`  | 1.16 |
+| PH16‑71  | CachyOS   | `7.0.12-1-cachyos`        | 1.16 |
 
 ## Requirements
 
@@ -169,8 +170,13 @@ order, for an **akmods** key (`/etc/pki/akmods/`), a **shim MOK**
 - **Arch / CachyOS** — if you manage Secure Boot with **sbctl**, the installer
   signs with your `db` keypair. Note `sbctl sign` only handles EFI binaries;
   kernel modules are signed with the kernel's `sign-file` using that same key,
-  which the installer does for you. Provide your own key with
-  `--mok-priv PATH --mok-cert PATH` if you don't use sbctl.
+  which the installer does for you.
+- **Custom keys (any distro)** — provide your own signing key explicitly with
+  `--mok-priv PATH --mok-cert PATH` (these imply `--secureboot`). Useful if you
+  don't use sbctl/akmods or keep your MOK elsewhere. The `make` knob only does
+  auto-detection, so run `install.sh` directly for custom paths:
+  `sudo packaging/fedora/install.sh --manual --mok-priv ~/MOK.priv --mok-cert ~/MOK.der`
+  (swap `--manual` for `--hook` on Fedora).
 
 If `SECUREBOOT=1` is set but no key can be found, the install aborts with
 instructions rather than installing a module that won't load.
