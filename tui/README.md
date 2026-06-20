@@ -1,7 +1,7 @@
 # GUI
 
 Frontends for the venator CLI. Both subprocess into
-`venator` for mutations and read `/sys/class/predator/keyboard0/`
+`venator` for mutations and read `/sys/class/venator/keyboard0/`
 directly for the live preview, so the CLI stays canonical and the GUIs
 don't duplicate its logic.
 
@@ -29,7 +29,7 @@ venator tui
 
 ## Module layout
 
-The TUI is split into focused modules (all flat `.py` files in `gui/`
+The TUI is split into focused modules (all flat `.py` files in `tui/`
 so the install glob picks them up):
 
 ```
@@ -74,7 +74,7 @@ list, and give it a `_foo_handle_button` if it has buttons.
 sysfs reads      subprocess
     |                 |
 /sys/class/      venator
-predator/        (the CLI)
+venator/        (the CLI)
 keyboard0/             |
                        v
                   /sys + kmod
@@ -83,7 +83,7 @@ keyboard0/             |
 `client.py` lives next to the frontend modules and is imported by
 `tui.py` (and the tab mixins) directly when the CLI execs it. The CLI's
 `tui` subcommand handles locating `tui.py` under
-`/usr/local/share/venator/gui/` (or the source checkout) and
+`/usr/local/share/venator/tui/` (or the source checkout) and
 exec'ing python on it.
 
 ## Why subprocess and not "GUI writes /sys directly"?

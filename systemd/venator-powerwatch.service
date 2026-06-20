@@ -11,7 +11,7 @@
 #
 # It's a user service for the same reason restore is: the AC/battery
 # policy lives in the user's ~/.config/venator/power-policy.json.
-# Writing /sys/firmware/acpi/platform_profile needs the `predator` group
+# Writing /sys/firmware/acpi/platform_profile needs the `venator` group
 # (granted by venator-perms.service), which the user has.
 
 [Unit]

@@ -10,7 +10,7 @@ build + signing routine.
 One command does the right thing per distro:
 
 ```bash
-sudo make module-install        # = packaging/fedora/install.sh --auto
+sudo make module-install        # = ./install.sh --auto
 ```
 
 `install.sh` reads `/etc/os-release` (`ID` / `ID_LIKE`) and dispatches:
@@ -97,6 +97,8 @@ aborts rather than producing a module that won't load.
 --mok-priv PATH       explicit signing private key (.priv/.key); implies --secureboot
 --mok-cert PATH       explicit signing cert (.der/.cer/.crt/.pem); implies --secureboot
 --no-sign             explicitly disable signing (the default)
+--uninstall           remove the module + everything install.sh installs
+--skip-group          don't create the venator group / set udev perms
 -h, --help            help
 ```
 
@@ -122,18 +124,18 @@ That installs:
 ## 3. Drop the sudo
 
 ```bash
-sudo groupadd -r predator
-sudo usermod -aG predator $USER
+sudo groupadd -r venator
+sudo usermod -aG venator $USER
 sudo udevadm control --reload
-sudo udevadm trigger -s predator
-newgrp predator           # or log out and log back in
+sudo udevadm trigger -s venator
+newgrp venator           # or log out and log back in
 ```
 
 Verify:
 
 ```bash
-ls -l /sys/class/predator/keyboard0/mode
-# expect: -rw-rw-r-- 1 root predator ...
+ls -l /sys/class/venator/keyboard0/mode
+# expect: -rw-rw-r-- 1 root venator ...
 venator status     # no sudo!
 venator rgb static '#ff0000'
 ```
@@ -142,7 +144,7 @@ If the group/mode columns still show `root root` and `-rw-r--r--`, the
 udev rule didn't fire. Verify:
 
 ```bash
-udevadm test /sys/class/predator/keyboard0 2>&1 | grep predator
+udevadm test /sys/class/venator/keyboard0 2>&1 | grep venator
 ```
 
 Most common cause: the module was loaded before `udevadm control --reload`.
@@ -180,6 +182,10 @@ via `~/.config/systemd/user/venator-restore.service`.
 sudo make uninstall            # everything: kernel module (hook or manual),
                                # userspace, units, modules-load.d. Also removes the
                                # kernel-install hook + /usr/src/venator.
+
+# kernel-module side only (module, hook, /usr/src/venator, modules-load.d,
+# udev rule, venator group) without touching the userspace CLI:
+sudo ./install.sh --uninstall
 ```
 
 Per-user state (`~/.config/venator/{profiles,keymap.json,animations,designs}`)

@@ -3,7 +3,7 @@
 """
 venator -- userspace CLI for the venator kernel module.
 
-Talks to /sys/class/predator/keyboard<N>/ exclusively. See docs/sysfs.md
+Talks to /sys/class/venator/keyboard<N>/ exclusively. See docs/sysfs.md
 for the ABI.
 
 Most subcommands stage state and then `apply`, so a single high-level
@@ -12,7 +12,7 @@ hardware transaction. The lower-level `mode`, `color`, `brightness`,
 `effect-id` subcommands only stage -- run `venator apply` when
 you're done tweaking, or use `--apply` on the last one.
 
-Writing /sys requires either root or membership in the `predator`
+Writing /sys requires either root or membership in the `venator`
 group (udev rule -- see Phase 4).
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-SYSFS_ROOT = Path("/sys/class/predator")
+SYSFS_ROOT = Path("/sys/class/venator")
 
 
 def _real_home() -> Path:
@@ -125,12 +125,12 @@ def die(msg: str, code: int = 1) -> None:
 
 
 def find_device() -> Path:
-    """Locate the keyboard sysfs device under /sys/class/predator/.
+    """Locate the keyboard sysfs device under /sys/class/venator/.
 
     Phase 6 added a sibling `battery0` device under the same class.
     A plain "first directory" pick will now sometimes return the
     battery device and then every rgb command dies looking for
-    /sys/class/predator/battery0/mode. Filter for keyboard* (which
+    /sys/class/venator/battery0/mode. Filter for keyboard* (which
     is the only name the HID driver in venator-main.c
     creates), with a sanity check that the picked entry has the
     expected LED attributes.
@@ -157,7 +157,7 @@ def write_text_attr(dev: Path, attr: str, value: str) -> None:
         path.write_text(value)
     except PermissionError:
         die(f"permission denied writing {path}.\n"
-            f"  Run with sudo, or add yourself to the 'predator' group "
+            f"  Run with sudo, or add yourself to the 'venator' group "
             f"once the udev rule is installed.")
     except OSError as e:
         die(f"write to {path} failed: {e}")
@@ -346,13 +346,13 @@ def start_keepalive(timeout: int) -> None:
 
 def _snapshot_lightbar() -> dict | None:
     """Read the current kernel-cached lightbar state. Returns None if
-    the lightbar driver isn't bound (no /sys/class/predator/lightbar0).
+    the lightbar driver isn't bound (no /sys/class/venator/lightbar0).
     """
-    if not PREDATOR_LIGHTBAR_DIR.exists():
+    if not VENATOR_LIGHTBAR_DIR.exists():
         return None
     out: dict = {}
     for attr in ("mode", "brightness", "speed", "direction", "color"):
-        p = PREDATOR_LIGHTBAR_DIR / attr
+        p = VENATOR_LIGHTBAR_DIR / attr
         if p.exists():
             try:
                 out[attr] = p.read_text().strip()
@@ -1832,7 +1832,7 @@ def cmd_power(args: argparse.Namespace) -> None:
         PLATFORM_PROFILE.write_text(target)
     except PermissionError:
         die(f"permission denied writing {PLATFORM_PROFILE} (try sudo, "
-            "or check the predator udev rule applies)")
+            "or check the venator udev rule applies)")
     except OSError as e:
         if "Invalid argument" in str(e) or e.errno == 22:
             die(f"kernel rejected {target!r}; valid choices: {' '.join(choices)}")
@@ -1925,9 +1925,9 @@ def _maybe_apply_power_rgb(profile: str) -> None:
         # die() raises SystemExit(1). Re-print the reason so the user
         # sees what went wrong (typically "device not found" if the
         # kernel module isn't loaded, or "permission denied" outside
-        # the predator group).
+        # the venator group).
         print(f"  auto-RGB: rgb_static failed (exit {e.code}). Is the "
-              f"venator kmod loaded + are you in the predator "
+              f"venator kmod loaded + are you in the venator "
               f"group?", file=sys.stderr)
     except Exception as e:
         print(f"  auto-RGB: rgb_static raised: {e}", file=sys.stderr)
@@ -2112,21 +2112,21 @@ def _do_attach_ppd() -> None:
         print(f"{label}: unmasked + started.")
 
 
-PREDATOR_BATTERY_DIR = Path("/sys/class/predator/battery0")
-PREDATOR_GAMING_DIR = Path("/sys/class/predator/gaming0")
-PREDATOR_LIGHTBAR_DIR = Path("/sys/class/predator/lightbar0")
+VENATOR_BATTERY_DIR = Path("/sys/class/venator/battery0")
+VENATOR_GAMING_DIR = Path("/sys/class/venator/gaming0")
+VENATOR_LIGHTBAR_DIR = Path("/sys/class/venator/lightbar0")
 
 
 def _end_threshold_path() -> Path | None:
     """Find a writable charge-limit sysfs path.
 
-    Prefer our own kernel module's /sys/class/predator/battery0/
+    Prefer our own kernel module's /sys/class/venator/battery0/
     (PH16-71 isn't in mainline acer_wmi_battery's quirk list). Fall
     back to /sys/class/power_supply/BAT*/charge_control_end_threshold
     for boards that ARE in the mainline quirk list (so the same CLI
     works on other Acers).
     """
-    p = PREDATOR_BATTERY_DIR / "charge_control_end_threshold"
+    p = VENATOR_BATTERY_DIR / "charge_control_end_threshold"
     if p.exists():
         return p
     bat = _find_battery()
@@ -2152,12 +2152,12 @@ def cmd_battery_info(_: argparse.Namespace) -> None:
         if p.exists():
             print(f"  {f:34s} {_read_first_line(p)}")
     # Our own kernel-module-exposed bits, if loaded.
-    if PREDATOR_BATTERY_DIR.exists():
+    if VENATOR_BATTERY_DIR.exists():
         print()
-        print(f"predator: {PREDATOR_BATTERY_DIR}")
+        print(f"venator: {VENATOR_BATTERY_DIR}")
         for f in ("charge_control_end_threshold",
                   "health_mode", "calibration_mode"):
-            p = PREDATOR_BATTERY_DIR / f
+            p = VENATOR_BATTERY_DIR / f
             if p.exists():
                 print(f"  {f:34s} {_read_first_line(p)}")
     elif not (bat / "charge_control_end_threshold").exists():
@@ -2192,7 +2192,7 @@ def cmd_battery_limit(args: argparse.Namespace) -> None:
         end_p.write_text(str(target))
     except PermissionError:
         die(f"permission denied writing {end_p} (try sudo, or check the "
-            "predator group + udev rule)")
+            "venator group + udev rule)")
     except OSError as e:
         if e.errno in (22, 34):  # EINVAL or ERANGE
             die(f"kernel rejected {target}; PH16-71 only supports 80 (cap) "
@@ -2222,18 +2222,18 @@ _MISC_ATTRS = {
 
 def _misc_path(name: str) -> Path:
     attr, _help = _MISC_ATTRS[name]
-    return PREDATOR_GAMING_DIR / attr
+    return VENATOR_GAMING_DIR / attr
 
 
 def cmd_misc(args: argparse.Namespace) -> None:
-    if not PREDATOR_GAMING_DIR.exists():
-        die("no /sys/class/predator/gaming0 — reload venator "
+    if not VENATOR_GAMING_DIR.exists():
+        die("no /sys/class/venator/gaming0 — reload venator "
             "(your kernel may not have built the WMBH half, or this "
             "firmware doesn't expose WMBH)")
     if args.feature is None:
         # status dump
         for cli_name, (attr, help_) in _MISC_ATTRS.items():
-            p = PREDATOR_GAMING_DIR / attr
+            p = VENATOR_GAMING_DIR / attr
             v = _read_first_line(p) if p.exists() else "(unavailable)"
             print(f"  {cli_name:18s} {v:8s}  {help_}")
         return
@@ -2257,7 +2257,7 @@ def cmd_misc(args: argparse.Namespace) -> None:
         p.write_text(target)
     except PermissionError:
         die(f"permission denied writing {p} (try sudo, or check the "
-            "predator group + udev rule)")
+            "venator group + udev rule)")
     except OSError as e:
         die(f"failed to set {args.feature}: {e}")
     print(f"{args.feature}: {_read_first_line(p)}")
@@ -2265,7 +2265,7 @@ def cmd_misc(args: argparse.Namespace) -> None:
 
 # ---------------------------------------------------- lightbar (rear EC RGB)
 #
-# /sys/class/predator/lightbar0/{mode, brightness, color, speed, direction,
+# /sys/class/venator/lightbar0/{mode, brightness, color, speed, direction,
 # apply, set, modes}. The `set` attr is the fast path — single write
 # atomically updates all five fields and commits. `apply` commits the
 # currently cached state without changing it.
@@ -2290,12 +2290,12 @@ LB_MODES = tuple(LB_MODE_IDS.keys())
 
 
 def _lb_path(attr: str) -> Path:
-    return PREDATOR_LIGHTBAR_DIR / attr
+    return VENATOR_LIGHTBAR_DIR / attr
 
 
 def _require_lightbar() -> None:
-    if not PREDATOR_LIGHTBAR_DIR.exists():
-        die("no /sys/class/predator/lightbar0 — reload venator "
+    if not VENATOR_LIGHTBAR_DIR.exists():
+        die("no /sys/class/venator/lightbar0 — reload venator "
             "(your kernel may not have built the WMBH lightbar half, "
             "or this firmware doesn't expose the lightbar method)")
 
@@ -2317,14 +2317,14 @@ def _write_lb(attr: str, value: str) -> None:
             f"older than this CLI. Rebuild + reload it:\n"
             f"  sudo make module-install\n"
             f"  sudo modprobe -r venator && sudo modprobe venator\n"
-            f"  ls /sys/class/predator/lightbar0/   # should now list '{attr}'")
+            f"  ls /sys/class/venator/lightbar0/   # should now list '{attr}'")
     try:
         p.write_text(value)
     except PermissionError:
         die(f"permission denied writing {p}.\n"
-            f"  - confirm you're in the 'predator' group:  groups | grep predator\n"
+            f"  - confirm you're in the 'venator' group:  groups | grep venator\n"
             f"  - reload udev:  sudo udevadm control --reload && "
-            f"sudo udevadm trigger -s predator\n"
+            f"sudo udevadm trigger -s venator\n"
             f"  - if still failing: sudo chmod g+w {p}")
     except OSError as e:
         die(f"failed to write {attr}: {e}")
@@ -2564,8 +2564,8 @@ def _apply_lightbar_section(lb: dict) -> None:
     """Apply the 'lightbar' half of a unified theme."""
     if not isinstance(lb, dict):
         return
-    if not PREDATOR_LIGHTBAR_DIR.exists():
-        print("  lightbar half skipped: no /sys/class/predator/lightbar0")
+    if not VENATOR_LIGHTBAR_DIR.exists():
+        print("  lightbar half skipped: no /sys/class/venator/lightbar0")
         return
     mode_name = (lb.get("mode") or "").strip().lower()
     if mode_name not in LB_MODE_IDS:
@@ -2716,7 +2716,7 @@ def _apply_unified_step(state: dict) -> None:
                 sys.stderr.write(f"keyboard step failed: {e}\n")
 
     lb = state.get("lightbar")
-    if isinstance(lb, dict) and PREDATOR_LIGHTBAR_DIR.exists():
+    if isinstance(lb, dict) and VENATOR_LIGHTBAR_DIR.exists():
         mode_name = (lb.get("mode") or "static").strip().lower()
         if mode_name in LB_MODE_IDS:
             mode_id = LB_MODE_IDS[mode_name]
@@ -2734,7 +2734,7 @@ def _apply_unified_step(state: dict) -> None:
             except (ValueError, IndexError):
                 r, g, b = 0xff, 0, 0
             try:
-                (PREDATOR_LIGHTBAR_DIR / "set").write_text(
+                (VENATOR_LIGHTBAR_DIR / "set").write_text(
                     f"{mode_id} {bright} {speed} {r} {g} {b}")
             except OSError as e:
                 sys.stderr.write(f"lightbar step failed: {e}\n")
@@ -2814,7 +2814,7 @@ def cmd_lightbar_modes(_: argparse.Namespace) -> None:
 def _lb_animation_dirs() -> list[Path]:
     """Search order:
        1. ~/.config/venator/animations/lightbar/   (user overrides)
-       2. Source-checkout sibling (cli/ and gui/ next to each other)
+       2. Source-checkout sibling (cli/ and tui/ next to each other)
        3. /usr/local/share/venator/animations/lightbar/
        4. /usr/share/venator/animations/lightbar/
 
@@ -2952,17 +2952,17 @@ def cmd_tui(args: argparse.Namespace) -> None:
     source checkout. Forwards any extra argv straight through.
     """
     candidates = [
-        Path("/usr/local/share/venator/gui/tui.py"),
-        Path("/usr/share/venator/gui/tui.py"),
+        Path("/usr/local/share/venator/tui/tui.py"),
+        Path("/usr/share/venator/tui/tui.py"),
         # Source checkout: alongside cli/venator
-        Path(__file__).resolve().parent.parent / "gui" / "tui.py",
+        Path(__file__).resolve().parent.parent / "tui" / "tui.py",
         # Or under /usr/local/bin's sibling /usr/local/share
-        Path(sys.argv[0]).resolve().parent.parent / "share" / "venator" / "gui" / "tui.py",
+        Path(sys.argv[0]).resolve().parent.parent / "share" / "venator" / "tui" / "tui.py",
     ]
     tui_path = next((p for p in candidates if p.is_file()), None)
     if tui_path is None:
         die("can't find tui.py — install via `sudo make install` "
-            "or run from a source checkout (cli/ + gui/ as siblings)")
+            "or run from a source checkout (cli/ + tui/ as siblings)")
     extra = getattr(args, "tui_args", []) or []
     try:
         os.execvp(sys.executable, [sys.executable, str(tui_path), *extra])
@@ -3191,8 +3191,8 @@ def _restore_lightbar_from_snap(snap: dict) -> None:
     lb = snap.get("lightbar")
     if not isinstance(lb, dict):
         return
-    if not PREDATOR_LIGHTBAR_DIR.exists():
-        sys.stderr.write("lightbar restore: /sys/class/predator/lightbar0 not present "
+    if not VENATOR_LIGHTBAR_DIR.exists():
+        sys.stderr.write("lightbar restore: /sys/class/venator/lightbar0 not present "
                          "(venator not loaded yet?); skipping\n")
         return
     mode_name = (lb.get("mode") or "").strip().lower()
@@ -3217,7 +3217,7 @@ def _restore_lightbar_from_snap(snap: dict) -> None:
         r, g, b = 0xff, 0, 0
 
     payload = f"{mode_id} {bright} {speed} {r} {g} {b}"
-    target = PREDATOR_LIGHTBAR_DIR / "set"
+    target = VENATOR_LIGHTBAR_DIR / "set"
     # Retry loop to ride out the udev → chgrp race on cold boot.
     last_err = None
     for attempt in range(10):
@@ -3504,7 +3504,7 @@ def build_parser() -> argparse.ArgumentParser:
     misc = sub.add_parser(
         "misc",
         help="LCD overdrive, boot sound, etc — gaming-misc toggles via WMBH "
-             "(needs /sys/class/predator/gaming0 from the kernel module)")
+             "(needs /sys/class/venator/gaming0 from the kernel module)")
     misc.add_argument("feature", nargs="?",
                       help=f"one of: {', '.join(sorted(_MISC_ATTRS))} "
                            "(omit to dump status of all)")
@@ -3515,7 +3515,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- lightbar (rear 3-zone EC RGB strip on PH16-71) ------------
     lb = sub.add_parser(
         "lightbar",
-        help="rear lightbar control (needs /sys/class/predator/lightbar0 "
+        help="rear lightbar control (needs /sys/class/venator/lightbar0 "
              "from the kernel module). Modes: " + ", ".join(LB_MODES),
         description=(
             "Control the Predator rear lightbar via the WMBH AcerGamingFunction\n"

@@ -34,6 +34,6 @@ install: all
 reload:
 	-sudo rmmod venator 2>/dev/null || true
 	sudo insmod venator.ko
-	@echo "Loaded. Watch:  sudo dmesg -w | grep predator"
+	@echo "Loaded. Watch:  sudo dmesg -w | grep venator"
 
 .PHONY: all clean install reload

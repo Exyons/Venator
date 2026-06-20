@@ -72,7 +72,7 @@ from tui_tab_unified import UnifiedTabMixin
 # violet-black field. Registered + applied in on_mount so it's the
 # startup theme; `t` cycles it against Textual's built-ins (see THEMES).
 NEON_PREDATOR = Theme(
-    name="neon-predator",
+    name="neon-venator",
     primary="#ff2e97",      # magenta — headers, card borders, tab bar
     secondary="#00e5ff",    # cyan — lightbar, secondary accents
     accent="#f7b32b",       # hot amber — taglines, highlights
@@ -170,7 +170,7 @@ class PredatorSenseApp(
         # Register + apply the Neon Predator theme before any refresh so
         # the first paint already carries the palette.
         self.register_theme(NEON_PREDATOR)
-        self.theme = "neon-predator"
+        self.theme = "neon-venator"
         self.title = "venator"
         self.sub_title = self.client.device_name()
         await self._reload_profile_list()

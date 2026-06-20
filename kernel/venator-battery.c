@@ -20,9 +20,9 @@
  * PH16-71 + cross-checked against Linuwu-Sense's struct layout.
  *
  * Sysfs surface:
- *   /sys/class/predator/battery0/health_mode               (RW, 0/1)
- *   /sys/class/predator/battery0/calibration_mode          (RW, 0/1)
- *   /sys/class/predator/battery0/charge_control_end_threshold (RW, 80|100)
+ *   /sys/class/venator/battery0/health_mode               (RW, 0/1)
+ *   /sys/class/venator/battery0/calibration_mode          (RW, 0/1)
+ *   /sys/class/venator/battery0/charge_control_end_threshold (RW, 80|100)
  *
  * The charge_control_end_threshold attr is a convenience that mirrors
  * mainline acer_wmi_battery's interface: writing "80" enables the
@@ -45,17 +45,17 @@
 #define BATTERY_NO_1     0x01
 #define HEALTH_LIMIT_PCT 80
 
-struct predator_battery {
+struct venator_battery {
 	struct wmi_device *wdev;
 	struct device     *class_dev;
 	struct mutex       lock;
 };
 
-static struct predator_battery *the_battery;     /* singleton */
+static struct venator_battery *the_battery;     /* singleton */
 
 /* ------------------------------------------------------------- low-level */
 
-static int wmbe_get(struct predator_battery *bat, u8 query, u8 status_out[5])
+static int wmbe_get(struct venator_battery *bat, u8 query, u8 status_out[5])
 {
 	u8 in_buf[4] = { BATTERY_NO_1, query, 0, 0 };
 	struct acpi_buffer in  = { sizeof(in_buf), in_buf };
@@ -85,7 +85,7 @@ done:
 	return ret;
 }
 
-static int wmbe_set(struct predator_battery *bat, u8 func_mask, u8 enable)
+static int wmbe_set(struct venator_battery *bat, u8 func_mask, u8 enable)
 {
 	u8 in_buf[8] = { BATTERY_NO_1, func_mask, !!enable, 0, 0, 0, 0, 0 };
 	struct acpi_buffer in  = { sizeof(in_buf), in_buf };
@@ -119,7 +119,7 @@ done:
 	return ret;
 }
 
-static int read_mode(struct predator_battery *bat, u8 query, int *out)
+static int read_mode(struct venator_battery *bat, u8 query, int *out)
 {
 	u8 status[5];
 	int err = wmbe_get(bat, query, status);
@@ -139,7 +139,7 @@ static int read_mode(struct predator_battery *bat, u8 query, int *out)
 static ssize_t health_mode_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	struct predator_battery *bat = dev_get_drvdata(dev);
+	struct venator_battery *bat = dev_get_drvdata(dev);
 	int v, err;
 
 	err = read_mode(bat, WMBE_FUNC_HEALTH, &v);
@@ -152,7 +152,7 @@ static ssize_t health_mode_store(struct device *dev,
 				 struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	struct predator_battery *bat = dev_get_drvdata(dev);
+	struct venator_battery *bat = dev_get_drvdata(dev);
 	bool enable;
 	int err;
 
@@ -167,7 +167,7 @@ static DEVICE_ATTR_RW(health_mode);
 static ssize_t calibration_mode_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
 {
-	struct predator_battery *bat = dev_get_drvdata(dev);
+	struct venator_battery *bat = dev_get_drvdata(dev);
 	int v, err;
 
 	err = read_mode(bat, WMBE_FUNC_CALIBRATION, &v);
@@ -180,7 +180,7 @@ static ssize_t calibration_mode_store(struct device *dev,
 				      struct device_attribute *attr,
 				      const char *buf, size_t count)
 {
-	struct predator_battery *bat = dev_get_drvdata(dev);
+	struct venator_battery *bat = dev_get_drvdata(dev);
 	bool enable;
 	int err;
 
@@ -204,7 +204,7 @@ static DEVICE_ATTR_RW(calibration_mode);
 static ssize_t charge_control_end_threshold_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
-	struct predator_battery *bat = dev_get_drvdata(dev);
+	struct venator_battery *bat = dev_get_drvdata(dev);
 	int v, err;
 
 	err = read_mode(bat, WMBE_FUNC_HEALTH, &v);
@@ -216,7 +216,7 @@ static ssize_t charge_control_end_threshold_show(struct device *dev,
 static ssize_t charge_control_end_threshold_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
-	struct predator_battery *bat = dev_get_drvdata(dev);
+	struct venator_battery *bat = dev_get_drvdata(dev);
 	unsigned int v;
 	int err;
 	bool enable;
@@ -235,26 +235,26 @@ static ssize_t charge_control_end_threshold_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(charge_control_end_threshold);
 
-static struct attribute *predator_battery_attrs[] = {
+static struct attribute *venator_battery_attrs[] = {
 	&dev_attr_health_mode.attr,
 	&dev_attr_calibration_mode.attr,
 	&dev_attr_charge_control_end_threshold.attr,
 	NULL,
 };
 
-static const struct attribute_group predator_battery_group = {
-	.attrs = predator_battery_attrs,
+static const struct attribute_group venator_battery_group = {
+	.attrs = venator_battery_attrs,
 };
-static const struct attribute_group *predator_battery_groups[] = {
-	&predator_battery_group,
+static const struct attribute_group *venator_battery_groups[] = {
+	&venator_battery_group,
 	NULL,
 };
 
 /* ------------------------------------------------------- WMI driver glue */
 
-static int predator_battery_probe(struct wmi_device *wdev, const void *ctx)
+static int venator_battery_probe(struct wmi_device *wdev, const void *ctx)
 {
-	struct predator_battery *bat;
+	struct venator_battery *bat;
 	int err;
 
 	if (the_battery) {
@@ -269,14 +269,14 @@ static int predator_battery_probe(struct wmi_device *wdev, const void *ctx)
 	bat->wdev = wdev;
 	mutex_init(&bat->lock);
 
-	if (!predator_class) {
+	if (!venator_class) {
 		err = -ENODEV;
 		goto out_free;
 	}
 
-	bat->class_dev = device_create_with_groups(predator_class, &wdev->dev,
+	bat->class_dev = device_create_with_groups(venator_class, &wdev->dev,
 				MKDEV(0, 0), bat,
-				predator_battery_groups, "battery0");
+				venator_battery_groups, "battery0");
 	if (IS_ERR(bat->class_dev)) {
 		err = PTR_ERR(bat->class_dev);
 		goto out_free;
@@ -292,9 +292,9 @@ out_free:
 	return err;
 }
 
-static void predator_battery_remove(struct wmi_device *wdev)
+static void venator_battery_remove(struct wmi_device *wdev)
 {
-	struct predator_battery *bat = dev_get_drvdata(&wdev->dev);
+	struct venator_battery *bat = dev_get_drvdata(&wdev->dev);
 
 	if (!bat)
 		return;
@@ -303,27 +303,27 @@ static void predator_battery_remove(struct wmi_device *wdev)
 	kfree(bat);
 }
 
-static const struct wmi_device_id predator_battery_id_table[] = {
-	{ .guid_string = PREDATOR_WMBE_GUID },
+static const struct wmi_device_id venator_battery_id_table[] = {
+	{ .guid_string = VENATOR_WMBE_GUID },
 	{ }
 };
-MODULE_DEVICE_TABLE(wmi, predator_battery_id_table);
+MODULE_DEVICE_TABLE(wmi, venator_battery_id_table);
 
-static struct wmi_driver predator_battery_wmi_driver = {
+static struct wmi_driver venator_battery_wmi_driver = {
 	.driver = {
 		.name = "venator-battery",
 	},
-	.id_table = predator_battery_id_table,
-	.probe    = predator_battery_probe,
-	.remove   = predator_battery_remove,
+	.id_table = venator_battery_id_table,
+	.probe    = venator_battery_probe,
+	.remove   = venator_battery_remove,
 };
 
-int predator_battery_init(void)
+int venator_battery_init(void)
 {
-	return wmi_driver_register(&predator_battery_wmi_driver);
+	return wmi_driver_register(&venator_battery_wmi_driver);
 }
 
-void predator_battery_exit(void)
+void venator_battery_exit(void)
 {
-	wmi_driver_unregister(&predator_battery_wmi_driver);
+	wmi_driver_unregister(&venator_battery_wmi_driver);
 }

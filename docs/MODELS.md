@@ -23,7 +23,7 @@ will be probed. Everything else falls through to `acer_wmi`.
 
 1. Collect the machine's identity: `cat /sys/class/dmi/id/product_name`
    and the keyboard's USB id from `lsusb` (the PH16-71 is `04F2:0117`).
-2. Open an issue with that info, plus the contents of `/sys/class/predator/`
+2. Open an issue with that info, plus the contents of `/sys/class/venator/`
    once the module is loaded (or a note that the keyboard stays dark).
 3. If the USB-HID id and WMI GUIDs match the PH16-71, add a DMI match row
    in `kernel/venator-main.c` and a row to this table.

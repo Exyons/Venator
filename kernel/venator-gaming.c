@@ -25,7 +25,7 @@
  * Both pack formats are reverse-engineered from the Ghidra decompile of
  * AcerAgentService.exe's named-pipe IPC layer.
  *
- * Sysfs surface (under /sys/class/predator/gaming0/):
+ * Sysfs surface (under /sys/class/venator/gaming0/):
  *   lcd_overdrive   (RW 0/1)  — 165 Hz LCD overdrive
  *   boot_sound      (RW 0/1)  — Acer startup chime
  *
@@ -45,10 +45,10 @@
 
 #include "venator.h"
 
-struct predator_gaming {
+struct venator_gaming {
 	struct wmi_device *wdev;
-	struct device     *class_dev;          /* /sys/class/predator/gaming0   */
-	struct device     *lightbar_dev;       /* /sys/class/predator/lightbar0 */
+	struct device     *class_dev;          /* /sys/class/venator/gaming0   */
+	struct device     *lightbar_dev;       /* /sys/class/venator/lightbar0 */
 	struct mutex       lock;
 
 	/* Cached lightbar state. Writes are staged here, then committed by
@@ -63,7 +63,7 @@ struct predator_gaming {
 	u8  lb_r, lb_g, lb_b;
 };
 
-static struct predator_gaming *the_gaming;
+static struct venator_gaming *the_gaming;
 
 /* ----------------------------------------------------------- low-level */
 
@@ -90,7 +90,7 @@ static u64 unpack_u64_le(const u8 *p, size_t n)
  * The return is a 4-byte buffer whose first byte is the WMI RETURN_CODE
  * (0 = SUCCESS, 1 = FAIL_TO_GET_DATA, 2 = TIMEOUT, 3 = WRONG_PARAMETERS).
  */
-static int wmbh_set_u64(struct predator_gaming *g, u8 method, u64 input)
+static int wmbh_set_u64(struct venator_gaming *g, u8 method, u64 input)
 {
 	u8 in_buf[8];
 	struct acpi_buffer in  = { sizeof(in_buf), in_buf };
@@ -136,7 +136,7 @@ done:
 /*
  * WMBH GetGaming*Setting: u32 in (index) → u64 out (value << 8 | status).
  */
-static int wmbh_get_u64(struct predator_gaming *g, u8 method, u8 index,
+static int wmbh_get_u64(struct venator_gaming *g, u8 method, u8 index,
 			u64 *value)
 {
 	u8 in_buf[4] = { index, 0, 0, 0 };
@@ -191,7 +191,7 @@ done:
  * OFF → u64 = 0x10
  * ON  → u64 = 0x10 | (1ULL << 48)
  */
-static int lcd_overdrive_write(struct predator_gaming *g, bool enable)
+static int lcd_overdrive_write(struct venator_gaming *g, bool enable)
 {
 	u64 v = (u64)GP_INDEX_LCD_OVERDRIVE;
 
@@ -200,7 +200,7 @@ static int lcd_overdrive_write(struct predator_gaming *g, bool enable)
 	return wmbh_set_u64(g, WMBH_SET_PROFILE_SETTING, v);
 }
 
-static int lcd_overdrive_read(struct predator_gaming *g, bool *enable)
+static int lcd_overdrive_read(struct venator_gaming *g, bool *enable)
 {
 	u64 value;
 	int err = wmbh_get_u64(g, WMBH_GET_PROFILE_SETTING,
@@ -223,14 +223,14 @@ static int lcd_overdrive_read(struct predator_gaming *g, bool *enable)
  *   state = 0 (OFF) → 0x0102
  *   state = 1 (ON)  → 0x0202
  */
-static int boot_sound_write(struct predator_gaming *g, bool enable)
+static int boot_sound_write(struct venator_gaming *g, bool enable)
 {
 	u64 v = ((u64)(enable ? 2 : 1) << 8) | GM_INDEX_BOOT_SOUND;
 
 	return wmbh_set_u64(g, WMBH_SET_MISC_SETTING, v);
 }
 
-static int boot_sound_read(struct predator_gaming *g, bool *enable)
+static int boot_sound_read(struct venator_gaming *g, bool *enable)
 {
 	u64 value;
 	int err = wmbh_get_u64(g, WMBH_GET_MISC_SETTING,
@@ -251,7 +251,7 @@ static int boot_sound_read(struct predator_gaming *g, bool *enable)
 static ssize_t _name##_show(struct device *dev,				\
 			    struct device_attribute *attr, char *buf)	\
 {									\
-	struct predator_gaming *g = dev_get_drvdata(dev);		\
+	struct venator_gaming *g = dev_get_drvdata(dev);		\
 	bool v;								\
 	int err = _read(g, &v);						\
 									\
@@ -264,7 +264,7 @@ static ssize_t _name##_store(struct device *dev,			\
 			     struct device_attribute *attr,		\
 			     const char *buf, size_t count)		\
 {									\
-	struct predator_gaming *g = dev_get_drvdata(dev);		\
+	struct venator_gaming *g = dev_get_drvdata(dev);		\
 	bool enable;							\
 	int err = kstrtobool(buf, &enable);				\
 									\
@@ -278,17 +278,17 @@ static DEVICE_ATTR_RW(_name)
 DEFINE_BOOL_ATTR(lcd_overdrive, lcd_overdrive_read, lcd_overdrive_write);
 DEFINE_BOOL_ATTR(boot_sound,    boot_sound_read,    boot_sound_write);
 
-static struct attribute *predator_gaming_attrs[] = {
+static struct attribute *venator_gaming_attrs[] = {
 	&dev_attr_lcd_overdrive.attr,
 	&dev_attr_boot_sound.attr,
 	NULL,
 };
 
-static const struct attribute_group predator_gaming_group = {
-	.attrs = predator_gaming_attrs,
+static const struct attribute_group venator_gaming_group = {
+	.attrs = venator_gaming_attrs,
 };
-static const struct attribute_group *predator_gaming_groups[] = {
-	&predator_gaming_group,
+static const struct attribute_group *venator_gaming_groups[] = {
+	&venator_gaming_group,
 	NULL,
 };
 
@@ -312,7 +312,7 @@ static const struct attribute_group *predator_gaming_groups[] = {
  *   9  0x02
  *  10..15  0x00 padding
  */
-static int wmbh_set_lightbar(struct predator_gaming *g)
+static int wmbh_set_lightbar(struct venator_gaming *g)
 {
 	u8 in_buf[16] = {
 		g->lb_mode,
@@ -416,7 +416,7 @@ static int lb_id_is_known(u8 id)
 static ssize_t lb_mode_show(struct device *dev,
 			    struct device_attribute *attr, char *buf)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%s\n", lb_name_for(g->lb_mode));
 }
@@ -425,7 +425,7 @@ static ssize_t lb_mode_store(struct device *dev,
 			     struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	char name[16];
 	unsigned int v;
 	u8 id;
@@ -449,7 +449,7 @@ static DEVICE_ATTR(mode, 0644, lb_mode_show, lb_mode_store);
 static ssize_t lb_brightness_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", g->lb_brightness);
 }
@@ -457,7 +457,7 @@ static ssize_t lb_brightness_store(struct device *dev,
 				   struct device_attribute *attr,
 				   const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	unsigned int v;
 	int err = kstrtouint(buf, 0, &v);
 
@@ -473,7 +473,7 @@ static DEVICE_ATTR(brightness, 0644, lb_brightness_show, lb_brightness_store);
 static ssize_t lb_speed_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", g->lb_speed);
 }
@@ -481,7 +481,7 @@ static ssize_t lb_speed_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	unsigned int v;
 	int err = kstrtouint(buf, 0, &v);
 
@@ -497,7 +497,7 @@ static DEVICE_ATTR(speed, 0644, lb_speed_show, lb_speed_store);
 static ssize_t lb_direction_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%u\n", g->lb_dir);
 }
@@ -505,7 +505,7 @@ static ssize_t lb_direction_store(struct device *dev,
 				  struct device_attribute *attr,
 				  const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	unsigned int v;
 	int err = kstrtouint(buf, 0, &v);
 
@@ -521,7 +521,7 @@ static DEVICE_ATTR(direction, 0644, lb_direction_show, lb_direction_store);
 static ssize_t lb_color_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf, "%02x%02x%02x\n",
 			  g->lb_r, g->lb_g, g->lb_b);
@@ -530,7 +530,7 @@ static ssize_t lb_color_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	const char *p = buf;
 	unsigned int r, gr, b;
 
@@ -550,7 +550,7 @@ static ssize_t lb_apply_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	int err = wmbh_set_lightbar(g);
 
 	return err ? err : count;
@@ -565,7 +565,7 @@ static ssize_t lb_set_store(struct device *dev,
 			    struct device_attribute *attr,
 			    const char *buf, size_t count)
 {
-	struct predator_gaming *g = dev_get_drvdata(dev);
+	struct venator_gaming *g = dev_get_drvdata(dev);
 	unsigned int mode, bright, speed, r, gr, b;
 	int n, err;
 
@@ -616,7 +616,7 @@ static DEVICE_ATTR(modes, 0444, lb_modes_show, NULL);
  * it, the path can be added here.
  */
 
-static struct attribute *predator_lightbar_attrs[] = {
+static struct attribute *venator_lightbar_attrs[] = {
 	&dev_attr_mode.attr,
 	&dev_attr_brightness.attr,
 	&dev_attr_speed.attr,
@@ -627,19 +627,19 @@ static struct attribute *predator_lightbar_attrs[] = {
 	&dev_attr_modes.attr,
 	NULL,
 };
-static const struct attribute_group predator_lightbar_group = {
-	.attrs = predator_lightbar_attrs,
+static const struct attribute_group venator_lightbar_group = {
+	.attrs = venator_lightbar_attrs,
 };
-static const struct attribute_group *predator_lightbar_groups[] = {
-	&predator_lightbar_group,
+static const struct attribute_group *venator_lightbar_groups[] = {
+	&venator_lightbar_group,
 	NULL,
 };
 
 /* ------------------------------------------------------- WMI driver glue */
 
-static int predator_gaming_probe(struct wmi_device *wdev, const void *ctx)
+static int venator_gaming_probe(struct wmi_device *wdev, const void *ctx)
 {
-	struct predator_gaming *g;
+	struct venator_gaming *g;
 	int err;
 
 	if (the_gaming) {
@@ -661,22 +661,22 @@ static int predator_gaming_probe(struct wmi_device *wdev, const void *ctx)
 	g->lb_dir        = 1;
 	g->lb_r = 0xff; g->lb_g = 0x00; g->lb_b = 0x00;
 
-	if (!predator_class) {
+	if (!venator_class) {
 		err = -ENODEV;
 		goto out_free;
 	}
 
-	g->class_dev = device_create_with_groups(predator_class, &wdev->dev,
+	g->class_dev = device_create_with_groups(venator_class, &wdev->dev,
 				MKDEV(0, 0), g,
-				predator_gaming_groups, "gaming0");
+				venator_gaming_groups, "gaming0");
 	if (IS_ERR(g->class_dev)) {
 		err = PTR_ERR(g->class_dev);
 		goto out_free;
 	}
 
-	g->lightbar_dev = device_create_with_groups(predator_class, &wdev->dev,
+	g->lightbar_dev = device_create_with_groups(venator_class, &wdev->dev,
 				MKDEV(0, 0), g,
-				predator_lightbar_groups, "lightbar0");
+				venator_lightbar_groups, "lightbar0");
 	if (IS_ERR(g->lightbar_dev)) {
 		err = PTR_ERR(g->lightbar_dev);
 		dev_warn(&wdev->dev,
@@ -697,9 +697,9 @@ out_free:
 	return err;
 }
 
-static void predator_gaming_remove(struct wmi_device *wdev)
+static void venator_gaming_remove(struct wmi_device *wdev)
 {
-	struct predator_gaming *g = dev_get_drvdata(&wdev->dev);
+	struct venator_gaming *g = dev_get_drvdata(&wdev->dev);
 
 	if (!g)
 		return;
@@ -710,27 +710,27 @@ static void predator_gaming_remove(struct wmi_device *wdev)
 	kfree(g);
 }
 
-static const struct wmi_device_id predator_gaming_id_table[] = {
-	{ .guid_string = PREDATOR_WMBH_GUID },
+static const struct wmi_device_id venator_gaming_id_table[] = {
+	{ .guid_string = VENATOR_WMBH_GUID },
 	{ }
 };
-MODULE_DEVICE_TABLE(wmi, predator_gaming_id_table);
+MODULE_DEVICE_TABLE(wmi, venator_gaming_id_table);
 
-static struct wmi_driver predator_gaming_wmi_driver = {
+static struct wmi_driver venator_gaming_wmi_driver = {
 	.driver = {
 		.name = "venator-gaming",
 	},
-	.id_table = predator_gaming_id_table,
-	.probe    = predator_gaming_probe,
-	.remove   = predator_gaming_remove,
+	.id_table = venator_gaming_id_table,
+	.probe    = venator_gaming_probe,
+	.remove   = venator_gaming_remove,
 };
 
-int predator_gaming_init(void)
+int venator_gaming_init(void)
 {
-	return wmi_driver_register(&predator_gaming_wmi_driver);
+	return wmi_driver_register(&venator_gaming_wmi_driver);
 }
 
-void predator_gaming_exit(void)
+void venator_gaming_exit(void)
 {
-	wmi_driver_unregister(&predator_gaming_wmi_driver);
+	wmi_driver_unregister(&venator_gaming_wmi_driver);
 }

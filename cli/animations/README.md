@@ -27,7 +27,7 @@ Arguments to `render`:
   highlight specific physical keys, e.g. `keymap["keys"].get("Esc")`.
 
 The return value must be exactly `num_cells * 3` bytes. The CLI writes
-the buffer to `/sys/class/predator/keyboard0/frame` and commits in one
+the buffer to `/sys/class/venator/keyboard0/frame` and commits in one
 transaction per tick.
 
 ## Examples shipped here

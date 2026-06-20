@@ -175,7 +175,7 @@ order, for an **akmods** key (`/etc/pki/akmods/`), a **shim MOK**
   `--mok-priv PATH --mok-cert PATH` (these imply `--secureboot`). Useful if you
   don't use sbctl/akmods or keep your MOK elsewhere. The `make` knob only does
   auto-detection, so run `install.sh` directly for custom paths:
-  `sudo packaging/fedora/install.sh --manual --mok-priv ~/MOK.priv --mok-cert ~/MOK.der`
+  `sudo ./install.sh --manual --mok-priv ~/MOK.priv --mok-cert ~/MOK.der`
   (swap `--manual` for `--hook` on Fedora).
 
 If `SECUREBOOT=1` is set but no key can be found, the install aborts with
@@ -185,10 +185,10 @@ instructions rather than installing a module that won't load.
 `venator-restore` (restore at login) and
 `venator-powerwatch` (live AC/battery profile switching). A
 system `venator-perms` unit hands the relevant `/sys` entries to
-the `predator` group so you don't need `sudo` for everyday use:
+the `venator` group so you don't need `sudo` for everyday use:
 
 ```bash
-sudo usermod -aG predator,input "$USER"   # then log out / back in
+sudo usermod -aG venator,input "$USER"   # then log out / back in
 ```
 
 Full details in
@@ -394,7 +394,7 @@ flowchart LR
       ACER[mainline acer-wmi]
     end
 
-    CLI & TUI --> SYSFS[/sys/class/predator/*\n/sys/firmware/acpi/platform_profile/]
+    CLI & TUI --> SYSFS[/sys/class/venator/*\n/sys/firmware/acpi/platform_profile/]
     SYSFS --> MOD
     MOD -->|HID reports| HID
     MOD -->|wmi_evaluate_method| WMI
@@ -404,7 +404,7 @@ flowchart LR
 On the PH16‑71 the **keyboard LEDs hang off the keyboard MCU**
 (`04F2:0117`, Chicony) and are driven over USB‑HID, *not* the EC/WMI RGB
 path that the community modules (`Linuwu-Sense`,
-`acer-predator-turbo-and-rgb-keyboard-linux-module`) assume — which is
+`acer-venator-turbo-and-rgb-keyboard-linux-module`) assume — which is
 why those load cleanly but light nothing on this chassis. Commands are
 8‑byte HID feature reports; per‑key frames are 8×64‑byte interrupt‑OUT
 bursts (128 cells × `{0x00,R,G,B}`). The **rear lightbar** uses the EC
@@ -414,13 +414,14 @@ sysfs ABI is documented in [`docs/sysfs.md`](docs/sysfs.md).
 ## Project layout
 
 ```
+install.sh       OS-aware kernel-module installer (build/sign/install/uninstall)
 kernel/          out-of-tree module (HID + WMBH/WMBE) + DKMS config
 cli/             venator — the CLI (stdlib Python); designs/, animations/, keymaps/
-gui/             Textual TUI (tui.py) + shared client library (client.py)
+tui/             Textual TUI (tui.py) + shared client library (client.py)
 systemd/         restore-at-login, powerwatch, and perms units
 udev/            group-based sysfs permissions
 modules-load.d/  auto-load the module at boot
-packaging/fedora OS-aware kernel-module installer (install.sh) + hook
+packaging/fedora Fedora kernel-install hook (99-venator.install) used by install.sh
 docs/            sysfs.md, INSTALL.md, MODELS.md
 ```
 
@@ -464,7 +465,7 @@ anywhere.
 
 - The Acer Linux community, including
   [Linuwu‑Sense](https://github.com/0x7375646F/Linuwu-Sense) and
-  [acer‑predator‑turbo‑and‑rgb‑keyboard‑linux‑module](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module),
+  [acer‑venator‑turbo‑and‑rgb‑keyboard‑linux‑module](https://github.com/JafarAkhondali/acer-venator-turbo-and-rgb-keyboard-linux-module),
   for prior reverse‑engineering of the WMI paths.
 - [OpenRGB](https://openrgb.org/) — the SDK capture that revealed the
   lightbar's Static (Direct) mode.

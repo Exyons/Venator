@@ -97,7 +97,7 @@ class LightbarTabMixin:
 
     def _apply_lightbar(self, *, mode: str | None = None) -> None:
         if not self.client.lightbar_present():
-            self.notify("no /sys/class/predator/lightbar0 — kernel module not loaded?",
+            self.notify("no /sys/class/venator/lightbar0 — kernel module not loaded?",
                         severity="warning", timeout=4)
             return
         kw = self._read_lb_inputs()

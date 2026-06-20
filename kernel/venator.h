@@ -14,13 +14,13 @@
 #define ACER_KBD_PID            0x0117
 
 /* Only this interface carries the LED command + frame channels. */
-#define PREDATOR_LED_IFACE      3
+#define VENATOR_LED_IFACE      3
 
 /* Wire sizes. */
-#define PREDATOR_CMD_LEN        8       /* 8-byte HID feature reports */
-#define PREDATOR_NUM_CELLS      128     /* 128 logical key cells in per-key mode */
-#define PREDATOR_FRAME_LEN      (PREDATOR_NUM_CELLS * 4)        /* 512 bytes on EP4 */
-#define PREDATOR_FRAME_RGB_LEN  (PREDATOR_NUM_CELLS * 3)        /* 384 bytes seen by userspace */
+#define VENATOR_CMD_LEN        8       /* 8-byte HID feature reports */
+#define VENATOR_NUM_CELLS      128     /* 128 logical key cells in per-key mode */
+#define VENATOR_FRAME_LEN      (VENATOR_NUM_CELLS * 4)        /* 512 bytes on EP4 */
+#define VENATOR_FRAME_RGB_LEN  (VENATOR_NUM_CELLS * 3)        /* 384 bytes seen by userspace */
 
 /* Transfer-buffer sizes (= wire size + 1 leading byte for the HID report
  * ID). The device declares no Report ID, but Linux's usbhid raw_request
@@ -28,8 +28,8 @@
  * the report ID and strip it before placing the bytes on the wire.
  * We allocate one extra byte so the actual payload lives in buf[1..].
  */
-#define PREDATOR_CMD_BUF_LEN    (PREDATOR_CMD_LEN + 1)          /* 9 */
-#define PREDATOR_FRAME_BUF_LEN  (PREDATOR_FRAME_LEN + 1)        /* 513 */
+#define VENATOR_CMD_BUF_LEN    (VENATOR_CMD_LEN + 1)          /* 9 */
+#define VENATOR_FRAME_BUF_LEN  (VENATOR_FRAME_LEN + 1)        /* 513 */
 
 /* Opcodes (byte 0 of every 8-byte command). */
 #define OP_BEGIN                0x88
@@ -66,7 +66,7 @@
 #define SCOPE_ZONE              0x01
 #define SCOPE_PERKEY            0x08
 
-enum predator_mode {
+enum venator_mode {
         PMODE_OFF = 0,
         PMODE_STATIC,
         PMODE_BREATHING,
@@ -92,7 +92,7 @@ enum predator_mode {
  * Wire format reverse-engineered from the WMBE method and matches
  * Linuwu-Sense's struct layout 1:1.
  */
-#define PREDATOR_WMBE_GUID "79772EC5-04B1-4BFD-843C-61E7F77B6CC9"
+#define VENATOR_WMBE_GUID "79772EC5-04B1-4BFD-843C-61E7F77B6CC9"
 
 /* WMBE method IDs (Arg1 to wmidev_evaluate_method). */
 #define WMBE_GET_BATTERY_HEALTH 0x14
@@ -112,7 +112,7 @@ enum predator_mode {
  * Pack formats here were derived from the per-feature wrappers in
  * AcerAgentService.exe.
  */
-#define PREDATOR_WMBH_GUID "7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56"
+#define VENATOR_WMBH_GUID "7A4DDFE7-5B5D-40B4-8595-4408E0CC7F56"
 
 /* WMBH method IDs (Arg1). Subset implemented today.
  */
@@ -157,15 +157,15 @@ enum predator_mode {
 
 /* Shared bits used by both halves of the module. The struct class is
  * created in venator.c init and reused by the battery + gaming
- * halves to hang /sys/class/predator/{battery0,gaming0} off it.
+ * halves to hang /sys/class/venator/{battery0,gaming0} off it.
  */
 struct class;
-extern struct class *predator_class;
+extern struct class *venator_class;
 
-int  predator_battery_init(void);
-void predator_battery_exit(void);
+int  venator_battery_init(void);
+void venator_battery_exit(void);
 
-int  predator_gaming_init(void);
-void predator_gaming_exit(void);
+int  venator_gaming_init(void);
+void venator_gaming_exit(void);
 
 #endif /* _VENATOR_H_ */

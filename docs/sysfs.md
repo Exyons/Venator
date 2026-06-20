@@ -1,4 +1,4 @@
-# sysfs ABI — `/sys/class/predator/keyboard<N>/`
+# sysfs ABI — `/sys/class/venator/keyboard<N>/`
 
 Stable surface for `cli/venator` and any GUI. One device directory per matched keyboard MCU (currently always exactly one on PH16-71).
 
@@ -45,7 +45,7 @@ The board has more EFF bytes than named modes (e.g. `0x07` ≈ `0x06`,
 direction). Use `effect_id`:
 
 ```bash
-cd /sys/class/predator/keyboard0
+cd /sys/class/venator/keyboard0
 echo '#ff0000' > color
 echo 200       > brightness
 echo static    > mode      # keeps MODE_TAG and SCOPE consistent
@@ -71,7 +71,7 @@ info/
 Solid red, full brightness:
 
 ```bash
-cd /sys/class/predator/keyboard0
+cd /sys/class/venator/keyboard0
 echo static  > mode
 echo "#ff0000" > color
 echo 255     > brightness
@@ -89,7 +89,7 @@ All keys green via per-key path:
 
 ```bash
 python3 -c "import sys; sys.stdout.buffer.write(bytes([0x00, 0xff, 0x00] * 128))" \
-    | sudo tee /sys/class/predator/keyboard0/frame >/dev/null
+    | sudo tee /sys/class/venator/keyboard0/frame >/dev/null
 echo perkey > mode
 echo 1      > apply
 ```

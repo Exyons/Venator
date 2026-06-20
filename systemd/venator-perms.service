@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Hand /sys entries used by `venator power` / `venator
-# battery limit` to the `predator` group, so the CLI doesn't need sudo.
+# battery limit` to the `venator` group, so the CLI doesn't need sudo.
 #
 # Why a oneshot service instead of a udev rule:
 #   - /sys/firmware/acpi/platform_profile is created by the kernel
@@ -30,11 +30,11 @@ ExecStart=/bin/sh -c '\
            /sys/class/power_supply/BAT*/charge_control_start_threshold \
            /sys/class/power_supply/BAT*/charge_control_end_threshold \
            /sys/class/power_supply/BAT*/charge_behaviour \
-           /sys/class/predator/battery0/health_mode \
-           /sys/class/predator/battery0/calibration_mode \
-           /sys/class/predator/battery0/charge_control_end_threshold; do \
+           /sys/class/venator/battery0/health_mode \
+           /sys/class/venator/battery0/calibration_mode \
+           /sys/class/venator/battery0/charge_control_end_threshold; do \
     [ -e "$f" ] || continue; \
-    chgrp predator "$f" 2>/dev/null && chmod g+w "$f" 2>/dev/null; \
+    chgrp venator "$f" 2>/dev/null && chmod g+w "$f" 2>/dev/null; \
   done; \
   exit 0'
 

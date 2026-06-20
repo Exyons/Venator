@@ -140,7 +140,7 @@ class BatteryTabMixin:
         thresh = info.get("charge_control_end_threshold")
         if hm is None and thresh is None:
             self.query_one("#bat_health", Static).update(
-                "[yellow]predator battery driver not bound — "
+                "[yellow]venator battery driver not bound — "
                 "is the kernel module loaded?[/]"
             )
         else:

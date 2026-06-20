@@ -1,28 +1,32 @@
-# Kernel-module installer (`install.sh`)
+# Fedora kernel-install hook
+
+This directory holds **`99-venator.install`** — the Fedora `kernel-install`
+hook that the OS-aware installer (`install.sh`, at the **repo root**) deploys
+when it runs in `--hook` mode. The installer itself is no longer here; it's a
+global, distro-agnostic script at the top of the tree.
 
 `install.sh` is **OS-aware**. The default (`--auto`) reads `/etc/os-release`
 and runs the routine that fits the distro:
 
-- **Fedora / RHEL-like → `--hook`** — hooks into Fedora's own
-  `kernel-install` so every kernel upgrade re-builds + re-signs the module
-  with zero external moving parts (no akmods, no SRPM, no daemon).
+- **Fedora / RHEL-like → `--hook`** — installs `99-venator.install` into
+  `/etc/kernel/install.d/` so every kernel upgrade re-builds + re-signs the
+  module with zero external moving parts (no akmods, no SRPM, no daemon).
 - **Arch / CachyOS / other → `--manual`** — distro-agnostic one-shot:
   build, sign, install, load. Re-run after every kernel upgrade.
-
-(Despite living under `packaging/fedora/`, the script handles both. The
-directory name is historical.)
 
 ## Quick install
 
 ```bash
-# Auto-detect the OS and pick hook (Fedora) or manual (Arch/CachyOS).
+# Run from the repo root. Auto-detect the OS and pick hook (Fedora) or
+# manual (Arch/CachyOS).
 sudo ./install.sh
 
 # Force a routine:
 sudo ./install.sh --hook       # Fedora kernel-install hook
 sudo ./install.sh --manual     # one-shot build for current kernel
 
-sudo ./install.sh --secureboot         # auto-detect OS + sign for Secure Boot
+sudo ./install.sh --secureboot # auto-detect OS + sign for Secure Boot
+sudo ./install.sh --uninstall  # remove the module + everything it installed
 ```
 
 The module is **unsigned by default** (non-Secure Boot). Add `--secureboot`
@@ -41,7 +45,8 @@ loads on boot from now on. From the repo root the same routines are
 --mok-priv PATH       explicit signing private key (.priv/.key); implies --secureboot
 --mok-cert PATH       explicit signing cert (.der/.cer/.crt/.pem); implies --secureboot
 --no-sign             explicitly disable signing (the default)
---skip-group          don't create the predator group / set udev perms
+--uninstall           remove the module + everything install.sh installs
+--skip-group          don't create the venator group / set udev perms
 -h, --help            show this help
 ```
 

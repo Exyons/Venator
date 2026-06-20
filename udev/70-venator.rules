@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Grant the 'predator' group write access to the LED control attributes
+# Grant the 'venator' group write access to the LED control attributes
 # created by the venator kernel module, so userspace tooling
 # (cli/venator, future GUI) doesn't need sudo.
 #
 # Install (handled by `make install`):
 #   - copy this file to /etc/udev/rules.d/70-venator.rules
-#   - sudo groupadd -r predator
-#   - sudo usermod -aG predator $USER
+#   - sudo groupadd -r venator
+#   - sudo usermod -aG venator $USER
 #   - sudo udevadm control --reload
-#   - sudo udevadm trigger -s predator
-#   - newgrp predator    (or log out / back in for the new group to take)
+#   - sudo udevadm trigger -s venator
+#   - newgrp venator    (or log out / back in for the new group to take)
 
-ACTION=="add", SUBSYSTEM=="predator", \
+ACTION=="add", SUBSYSTEM=="venator", \
     RUN+="/bin/sh -c '\
         cd /sys$env{DEVPATH} 2>/dev/null && \
-        chgrp predator mode color brightness effect_id apply frame \
+        chgrp venator mode color brightness effect_id apply frame \
             speed direction set modes \
             health_mode calibration_mode charge_control_end_threshold \
             lcd_overdrive boot_sound \

@@ -2,7 +2,7 @@
 #
 # Top-level make for the userspace half of venator.
 # The kernel module has its own Makefile under kernel/; the OS-aware
-# kernel-module installer lives in packaging/fedora/install.sh.
+# kernel-module installer lives in ./install.sh (repo root).
 #
 # Targets:
 #   make install         install CLI + udev rule + systemd unit + modules-load
@@ -37,10 +37,10 @@ SYSTEMD_WATCH_UNIT := systemd/venator-powerwatch.service
 SYSTEMD_PERMS_UNIT := systemd/venator-perms.service
 MODULES_LOAD_CONF := modules-load.d/venator.conf
 
-# GUI bits. The TUI is now invoked via the `venator tui`
+# TUI bits. The TUI is now invoked via the `venator tui`
 # subcommand of the main CLI; the standalone `venator-tui`
 # launcher was retired in favour of that single entry point.
-GUI_DIR          := gui
+TUI_DIR          := tui
 
 # ANSI colour escapes for printf'd help / status output. Single-quoted
 # in recipes so $(VAR) expands at make-time and printf interprets the
@@ -110,7 +110,7 @@ install:
 	@printf '$(G)==>$(N) Installing systemd perms unit to $(DESTDIR)$(SYSTEMD_SYSTEM_DIR)/$(notdir $(SYSTEMD_PERMS_UNIT))\n'
 	@install -Dm644 $(SYSTEMD_PERMS_UNIT) $(DESTDIR)$(SYSTEMD_SYSTEM_DIR)/$(notdir $(SYSTEMD_PERMS_UNIT))
 	@# Enable the system-wide perms unit so platform_profile + battery
-	@# threshold writes don't need sudo for users in the predator group.
+	@# threshold writes don't need sudo for users in the venator group.
 	@if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null 2>&1; then \
 	    systemctl daemon-reload 2>/dev/null || true; \
 	    systemctl enable --now venator-perms.service 2>/dev/null || \
@@ -118,13 +118,13 @@ install:
 	fi
 	@printf '$(G)==>$(N) Installing modules-load.d entry to $(DESTDIR)$(MODULES_LOAD_DIR)/$(notdir $(MODULES_LOAD_CONF))\n'
 	@install -Dm644 $(MODULES_LOAD_CONF) $(DESTDIR)$(MODULES_LOAD_DIR)/$(notdir $(MODULES_LOAD_CONF))
-	@# GUI: client library + TUI .py modules to $(SHAREDIR)/gui/.
+	@# TUI: client library + TUI .py modules to $(SHAREDIR)/tui/.
 	@# The TUI is invoked via `venator tui` (no separate binary).
-	@if [ -d $(GUI_DIR) ]; then \
-	    printf '$(G)==>$(N) Installing GUI to %s/gui/\n' "$(DESTDIR)$(SHAREDIR)"; \
-	    mkdir -p $(DESTDIR)$(SHAREDIR)/gui; \
-	    find $(GUI_DIR) -maxdepth 1 -type f \( -name '*.py' -o -name '*.md' -o -name '*.tcss' \) \
-	        -exec install -m644 -t $(DESTDIR)$(SHAREDIR)/gui {} + ; \
+	@if [ -d $(TUI_DIR) ]; then \
+	    printf '$(G)==>$(N) Installing TUI to %s/tui/\n' "$(DESTDIR)$(SHAREDIR)"; \
+	    mkdir -p $(DESTDIR)$(SHAREDIR)/tui; \
+	    find $(TUI_DIR) -maxdepth 1 -type f \( -name '*.py' -o -name '*.md' -o -name '*.tcss' \) \
+	        -exec install -m644 -t $(DESTDIR)$(SHAREDIR)/tui {} + ; \
 	fi
 	@# Clean up any old standalone launcher from previous installs.
 	@rm -f $(DESTDIR)$(BINDIR)/venator-tui
@@ -147,7 +147,7 @@ install:
 	    fi; \
 	fi
 	@# Brief; the comprehensive "Done -- here's what to do next" summary
-	@# is printed by packaging/fedora/install.sh at the very end so the
+	@# is printed by ./install.sh at the very end so the
 	@# *-install targets give the user a single block of instructions at
 	@# the bottom of their terminal. Running `make install` alone is
 	@# supported but uncommon; tell them what to do.
@@ -221,9 +221,9 @@ uninstall:
 	@rm -f  $(DESTDIR)$(SYSTEMD_SYSTEM_DIR)/$(notdir $(SYSTEMD_PERMS_UNIT))
 	@printf '$(G)==>$(N) Removing $(DESTDIR)$(MODULES_LOAD_DIR)/$(notdir $(MODULES_LOAD_CONF))\n'
 	@rm -f  $(DESTDIR)$(MODULES_LOAD_DIR)/$(notdir $(MODULES_LOAD_CONF))
-	@printf '$(G)==>$(N) Removing GUI launcher + files\n'
+	@printf '$(G)==>$(N) Removing TUI launcher + files\n'
 	@rm -f  $(DESTDIR)$(BINDIR)/venator-tui
-	@rm -rf $(DESTDIR)$(SHAREDIR)/gui
+	@rm -rf $(DESTDIR)$(SHAREDIR)/tui
 	@udevadm control --reload 2>/dev/null || true
 	@printf '\n$(B)Uninstalled.$(N)\n'
 	@printf '  $(D)Per-user data left alone: ~/.config/venator/ (profiles,$(N)\n'
@@ -240,21 +240,21 @@ module-install: install
 	    echo "module-install must be run as root (sudo make module-install)"; \
 	    exit 1; \
 	fi
-	packaging/fedora/install.sh --auto $(SB_FLAG)
+	VENATOR_SKIP_USERSPACE=1 ./install.sh --auto $(SB_FLAG)
 
 hook-install: install
 	@if [ "$$EUID" -ne 0 ]; then \
 	    echo "hook-install must be run as root (sudo make hook-install)"; \
 	    exit 1; \
 	fi
-	packaging/fedora/install.sh --hook $(SB_FLAG)
+	VENATOR_SKIP_USERSPACE=1 ./install.sh --hook $(SB_FLAG)
 
 manual-install: install
 	@if [ "$$EUID" -ne 0 ]; then \
 	    echo "manual-install must be run as root (sudo make manual-install)"; \
 	    exit 1; \
 	fi
-	packaging/fedora/install.sh --manual $(SB_FLAG)
+	VENATOR_SKIP_USERSPACE=1 ./install.sh --manual $(SB_FLAG)
 
 purge: uninstall
 	@# uninstall + nuke per-user data. Useful for clean reinstalls.

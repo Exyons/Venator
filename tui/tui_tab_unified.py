@@ -102,7 +102,7 @@ class UnifiedTabMixin:
             _P("/usr/local/share/venator/designs/unified"),
             _P("/usr/share/venator/designs/unified"),
         ]
-        # Source-checkout fallback (cli/ next to gui/)
+        # Source-checkout fallback (cli/ next to tui/)
         try:
             here = _P(__file__).resolve().parent
             candidates.append(here.parent / "cli" / "designs" / "unified")

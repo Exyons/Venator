@@ -15,7 +15,7 @@ HEX_RE = re.compile(r"#?[0-9a-fA-F]{6}$")
 # Our own neon theme (registered in tui.py) leads the cycle so 't'
 # always returns home; Textual's built-ins follow for users who care.
 THEMES = [
-    "neon-predator",
+    "neon-venator",
     "textual-dark",
     "nord",
     "gruvbox",

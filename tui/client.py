@@ -3,8 +3,8 @@
 """Shared client library for venator GUIs (TUI + Qt).
 
 Architecture (decided in Phase 5 planning):
-  - State queries: read /sys/class/predator/keyboard0/ directly. Always
-    fast, no privilege issue (user is in the predator group via the
+  - State queries: read /sys/class/venator/keyboard0/ directly. Always
+    fast, no privilege issue (user is in the venator group via the
     udev rule).
   - State mutations: shell out to the `venator` CLI. Keeps the
     CLI canonical so GUIs don't need to reimplement profile auto-save,
@@ -28,7 +28,7 @@ import threading
 from pathlib import Path
 from typing import Iterable
 
-SYSFS_ROOT = Path("/sys/class/predator")
+SYSFS_ROOT = Path("/sys/class/venator")
 SHARE_DIRS = [
     Path("/usr/local/share/venator"),
     Path("/usr/share/venator"),
@@ -63,7 +63,7 @@ class PredatorSenseClient:
             )
         # Phase 6 added a sibling `battery0` device under the same class.
         # Pick the keyboard explicitly so the GUI/TUI doesn't end up
-        # reading /sys/class/predator/battery0/mode.
+        # reading /sys/class/venator/battery0/mode.
         kbds = sorted(p for p in SYSFS_ROOT.iterdir()
                       if p.is_dir() and p.name.startswith("keyboard"))
         if not kbds:
@@ -384,7 +384,7 @@ class PredatorSenseClient:
     def battery_attr_path(self, attr: str) -> Path | None:
         """Find the canonical path for a battery attribute.
 
-        Prefers /sys/class/predator/battery0/ (our own kernel module),
+        Prefers /sys/class/venator/battery0/ (our own kernel module),
         falls back to /sys/class/power_supply/BAT*/ for boards in
         mainline acer_wmi_battery's quirk list."""
         if self.battery_dev is not None:
@@ -415,7 +415,7 @@ class PredatorSenseClient:
                     info[k] = Path(bats[0], k).read_text().strip()
                 except OSError:
                     pass
-        # Our own /sys/class/predator/battery0/* (RW from the predator group):
+        # Our own /sys/class/venator/battery0/* (RW from the venator group):
         for k in ("health_mode", "calibration_mode",
                   "charge_control_end_threshold"):
             p = self.battery_attr_path(k)
@@ -450,7 +450,7 @@ class PredatorSenseClient:
     def set_calibration_mode(self, enable: bool) -> subprocess.CompletedProcess:
         """Toggle the firmware's one-shot calibration cycle. There's
         no `battery calibration` CLI subcommand yet; write the sysfs
-        attr directly (works for users in the predator group)."""
+        attr directly (works for users in the venator group)."""
         p = self.battery_attr_path("calibration_mode")
         if p is None:
             return subprocess.CompletedProcess(
@@ -466,7 +466,7 @@ class PredatorSenseClient:
 
     # ---- lightbar (rear EC RGB strip)
 
-    LIGHTBAR_DIR = Path("/sys/class/predator/lightbar0")
+    LIGHTBAR_DIR = Path("/sys/class/venator/lightbar0")
     LIGHTBAR_MODES = ("off", "breathing", "neon", "rainbow",
                       "wave", "ripple", "scanner", "strobe")
 

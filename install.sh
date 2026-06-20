@@ -74,7 +74,12 @@ Secure Boot (signing is OFF by default):
   --no-sign             Explicitly disable signing (this is the default).
 
 Other:
-  --skip-group          Don't create the predator group / set udev perms
+  --uninstall           Remove the kernel module + everything this script
+                        installs: loaded module, hook, /usr/src/venator,
+                        /lib/modules/*/extra/venator, modules-load.d /
+                        modprobe.d entries, the udev rule, and the venator
+                        group. (Run `make uninstall` for the userspace CLI.)
+  --skip-group          Don't create the venator group / set udev perms
   -h, --help            Show this help and exit.
 
 Examples:
@@ -84,6 +89,7 @@ Examples:
   sudo ./install.sh --manual                   # build for current kernel, unsigned
   sudo ./install.sh --mok-priv ~/MOK.priv \
                     --mok-cert ~/MOK.der       # sign with explicit keys
+  sudo ./install.sh --uninstall                # remove everything
 EOF
 }
 
@@ -98,6 +104,7 @@ while [ $# -gt 0 ]; do
         --auto)       METHOD=auto ;;
         --manual)     METHOD=manual ;;
         --hook)       METHOD=hook ;;
+        --uninstall)  METHOD=uninstall ;;
         --secureboot) DO_SIGN=yes ;;
         --mok-priv)   MOK_PRIV="$2"; DO_SIGN=yes; shift ;;
         --mok-cert)   MOK_CERT="$2"; DO_SIGN=yes; shift ;;
@@ -115,14 +122,19 @@ VERSION=0.1.0
 PKG_NAME=venator
 KVER=$(uname -r)
 
+# install.sh lives at the repo root, so REPO_ROOT is just its own dir.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
+REPO_ROOT="$SCRIPT_DIR"
 KERNEL_SRC="$REPO_ROOT/kernel"
+HOOK_SRC="$REPO_ROOT/packaging/fedora/99-${PKG_NAME}.install"
 
-[ -f "$KERNEL_SRC/venator-main.c" ] || \
-    fail "Can't find kernel sources at $KERNEL_SRC/. Run install.sh from a clone of the repo."
-[ -d "/lib/modules/${KVER}/build" ] || \
-    fail "Missing kernel headers/devel for the running kernel (${KVER}). Install the matching kernel-devel package and re-run."
+# Uninstall needs neither kernel sources nor headers — skip those checks.
+if [ "$METHOD" != uninstall ]; then
+    [ -f "$KERNEL_SRC/venator-main.c" ] || \
+        fail "Can't find kernel sources at $KERNEL_SRC/. Run install.sh from a clone of the repo."
+    [ -d "/lib/modules/${KVER}/build" ] || \
+        fail "Missing kernel headers/devel for the running kernel (${KVER}). Install the matching kernel-devel package and re-run."
+fi
 
 INVOKER=${SUDO_USER:-}     # the actual user who ran sudo, if any
 
@@ -227,23 +239,23 @@ ensure_akmods_keys() {
     warn "Reboot, MOK Manager appears, pick 'Enroll MOK', enter the password you set."
 }
 
-# ---------- predator group + udev -------------------------------------------
+# ---------- venator group + udev -------------------------------------------
 
 setup_group_and_udev() {
     [ "$DO_GROUP" -eq 1 ] || return 0
 
-    if ! getent group predator >/dev/null 2>&1; then
-        step "Creating 'predator' group"
-        groupadd -r predator
+    if ! getent group venator >/dev/null 2>&1; then
+        step "Creating 'venator' group"
+        groupadd -r venator
     fi
 
     if [ -n "$INVOKER" ] && [ "$INVOKER" != "root" ]; then
         local added=0
-        if ! id -nG "$INVOKER" 2>/dev/null | tr ' ' '\n' | grep -qx predator; then
-            step "Adding $INVOKER to 'predator' group"
-            usermod -aG predator "$INVOKER"; added=1
+        if ! id -nG "$INVOKER" 2>/dev/null | tr ' ' '\n' | grep -qx venator; then
+            step "Adding $INVOKER to 'venator' group"
+            usermod -aG venator "$INVOKER"; added=1
         else
-            step "$INVOKER already in 'predator' group"
+            step "$INVOKER already in 'venator' group"
         fi
         # The background worker reads /dev/input/by-path/*-event-kbd to
         # implement wake-on-keypress for our custom designs / animations.
@@ -254,23 +266,23 @@ setup_group_and_udev() {
             usermod -aG input "$INVOKER"; added=1
         fi
         if [ "$added" -eq 1 ]; then
-            warn "$INVOKER needs to log out + back in (or 'newgrp predator && newgrp input') for the new groups to take effect."
+            warn "$INVOKER needs to log out + back in (or 'newgrp venator && newgrp input') for the new groups to take effect."
         fi
     else
         warn "No SUDO_USER set. Add yourself manually:"
-        warn "  sudo usermod -aG predator,input <yourname>"
+        warn "  sudo usermod -aG venator,input <yourname>"
     fi
 
     step "Reloading udev rules"
     udevadm control --reload
 
-    if [ -d /sys/class/predator ]; then
-        step "Triggering udev for predator subsystem"
-        udevadm trigger -s predator
+    if [ -d /sys/class/venator ]; then
+        step "Triggering udev for venator subsystem"
+        udevadm trigger -s venator
         sleep 0.2  # give udev a moment to apply chgrp/chmod
         local mode_perm
-        mode_perm=$(stat -c '%a %G' /sys/class/predator/keyboard0/mode 2>/dev/null || true)
-        info "/sys/class/predator/keyboard0/mode  ->  $mode_perm  (want: 664 predator)"
+        mode_perm=$(stat -c '%a %G' /sys/class/venator/keyboard0/mode 2>/dev/null || true)
+        info "/sys/class/venator/keyboard0/mode  ->  $mode_perm  (want: 664 venator)"
     fi
 }
 
@@ -414,7 +426,8 @@ install_kernel_hook() {
 
     # 3. Install the hook script.
     step "Installing kernel-install hook to /etc/kernel/install.d/99-${PKG_NAME}.install"
-    install -Dm755 "$SCRIPT_DIR/99-${PKG_NAME}.install" \
+    [ -f "$HOOK_SRC" ] || fail "Hook script not found at $HOOK_SRC"
+    install -Dm755 "$HOOK_SRC" \
         "/etc/kernel/install.d/99-${PKG_NAME}.install"
 
     # 4. Drop the modules-load.d + blacklist entries (same as other methods).
@@ -457,7 +470,83 @@ enrolled in MOK. Run: sudo mokutil --import /etc/pki/akmods/certs/*.der \
 (then reboot to enroll). Or sign the module by hand — see README."
 }
 
+# ---------- uninstall --------------------------------------------------------
+
+# Tear down everything: the userspace half (CLI, share/, systemd units, udev
+# rule) via `make uninstall`, plus the kernel-module + group bits below that
+# `make uninstall` doesn't cover.
+uninstall_all() {
+    step "Uninstalling venator"
+
+    # Userspace: CLI, assets, udev rule, systemd units, modules-load.d, the
+    # kernel-install hook, /usr/src/venator, and any installed .ko — all
+    # handled by the top-level Makefile. (VENATOR_SKIP_USERSPACE=1 opts out.)
+    if [ "${VENATOR_SKIP_USERSPACE:-0}" != 1 ] && command -v make >/dev/null 2>&1; then
+        step "Removing userspace (CLI, udev rule, systemd units) via make uninstall"
+        make -C "$REPO_ROOT" uninstall || warn "make uninstall failed; some userspace files may remain"
+    fi
+
+    if lsmod | grep -q '^venator'; then
+        step "Unloading module"
+        rmmod venator 2>/dev/null || true
+    fi
+
+    # Fedora kernel-install hook + staged sources.
+    if [ -e "/etc/kernel/install.d/99-${PKG_NAME}.install" ]; then
+        step "Removing kernel-install hook"
+        rm -f "/etc/kernel/install.d/99-${PKG_NAME}.install"
+    fi
+    if [ -d "/usr/src/${PKG_NAME}" ]; then
+        step "Removing /usr/src/${PKG_NAME}"
+        rm -rf "/usr/src/${PKG_NAME}"
+    fi
+
+    # Installed module(s) under every kernel's extra/ + updates/.
+    step "Removing installed modules under /lib/modules/*/"
+    find /lib/modules -maxdepth 3 -type d -path '*/extra/venator' \
+        -exec rm -rf {} + 2>/dev/null || true
+    find /lib/modules -type f -name 'venator.ko*' \
+        -exec rm -f {} + 2>/dev/null || true
+
+    # Boot-time load + blacklist config.
+    rm -f /etc/modules-load.d/venator.conf \
+          /etc/modprobe.d/venator-blacklist.conf
+
+    step "Running depmod"
+    depmod -a "${KVER}" 2>/dev/null || depmod -a 2>/dev/null || true
+
+    # udev rule (installed by `make install`, but we set up the perms, so
+    # tear it down here too) + reload.
+    if [ -e /etc/udev/rules.d/70-venator.rules ]; then
+        step "Removing udev rule"
+        rm -f /etc/udev/rules.d/70-venator.rules
+        udevadm control --reload 2>/dev/null || true
+    fi
+
+    # The venator group (created by setup_group_and_udev). Leave the user's
+    # membership cleanup to them; just drop the group itself.
+    if getent group venator >/dev/null 2>&1; then
+        step "Removing 'venator' group"
+        groupdel venator 2>/dev/null || \
+            warn "Couldn't remove 'venator' group (still referenced?). Remove manually: sudo groupdel venator"
+    fi
+
+    cat <<EOF
+
+${C_BOLD}Uninstalled.${C_RESET}
+
+Left in place (shared / user-owned):
+  - signing keys at /etc/pki/akmods/ and /var/lib/sbctl/
+  - per-user config under ~/.config/venator/
+EOF
+}
+
 # ---------- run -------------------------------------------------------------
+
+if [ "$METHOD" = uninstall ]; then
+    uninstall_all
+    exit 0
+fi
 
 # Resolve the OS-specific routine when no method was forced on the CLI.
 #   Fedora (+ RHEL-likes)  -> hook   (kernel-install rebuilds on upgrade)
@@ -469,6 +558,21 @@ if [ "$METHOD" = auto ]; then
     esac
     step "Detected OS family '$(detect_os)' -> using '$METHOD' method"
 fi
+
+# Userspace install (CLI, assets, udev rule, systemd units, modules-load.d,
+# keymap seed). This is `make install`. Running install.sh standalone should
+# set up EVERYTHING, so we drive it from here — but skip when invoked via the
+# Makefile's *-install targets, which already ran `make install` as a
+# prerequisite (they export VENATOR_SKIP_USERSPACE=1 to avoid a double run).
+# Must run BEFORE setup_group_and_udev so the udev rule file is on disk when
+# we reload + trigger udev (otherwise sysfs perms never get applied).
+install_userspace() {
+    [ "${VENATOR_SKIP_USERSPACE:-0}" = 1 ] && return 0
+    command -v make >/dev/null 2>&1 || { warn "make not found; skipping userspace install (CLI/units/udev rule)"; return 0; }
+    step "Installing userspace (CLI, udev rule, systemd units) via make install"
+    make -C "$REPO_ROOT" install || warn "make install failed; CLI/units may be missing"
+}
+install_userspace
 
 case "$METHOD" in
     manual) install_manual ;;
@@ -484,6 +588,16 @@ setup_group_and_udev
 # the installer is harmless if it's already enabled.
 enable_restore_unit() {
     [ -n "$INVOKER" ] || { warn "No SUDO_USER set; skipping restore unit enable"; return; }
+    # The user units live under /etc/systemd/user/ and are installed by the
+    # userspace half (`make install`). Running install.sh standalone only
+    # does the kernel module, so the units may not be present yet — skip
+    # cleanly instead of throwing a "does not exist" failure.
+    if ! ls /etc/systemd/user/venator-restore.service >/dev/null 2>&1; then
+        info "Userspace not installed yet (venator-restore.service absent)."
+        info "Run 'sudo make install' for the CLI + user services, or"
+        info "'sudo make module-install' to do both in one shot."
+        return
+    fi
     local uid
     uid=$(id -u "$INVOKER" 2>/dev/null) || return
     local rundir="/run/user/$uid"
@@ -514,9 +628,9 @@ cat <<EOF
 ${C_BOLD}Done.${C_RESET}
 
 Verify:
-  lsmod | grep predator
-  ls /sys/class/predator/keyboard0/
-  ls /sys/class/predator/lightbar0/   # (if the gaming/WMBH half bound)
+  lsmod | grep venator
+  ls /sys/class/venator/keyboard0/
+  ls /sys/class/venator/lightbar0/   # (if the gaming/WMBH half bound)
 
 The 'default' profile auto-snapshots every keyboard + lightbar mutation
 and is replayed at login via venator-restore.service (enabled
