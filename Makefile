@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Top-level make for the userspace half of venator.
-# The kernel module has its own Makefile under kernel/, plus a
-# Fedora akmods packaging flow under packaging/fedora/.
+# The kernel module has its own Makefile under kernel/; the OS-aware
+# kernel-module installer lives in packaging/fedora/install.sh.
 #
 # Targets:
 #   make install         install CLI + udev rule + systemd unit + modules-load
 #   make uninstall       reverse the above
-#   make hook-install    Fedora kernel-install hook (recommended)
-#   make akmods-install  legacy akmods path (still works)
-#   make manual-install  one-shot build for the current kernel
+#   make module-install  detect OS + build/sign/install the kernel module
+#                        (Fedora -> kernel-install hook, Arch/CachyOS -> manual)
+#   make hook-install    force the Fedora kernel-install hook routine
+#   make manual-install  force a one-shot build for the current kernel
 #   make help            show this
 #
 # Install root knobs (defaults match /usr/local hierarchy):
@@ -53,22 +54,22 @@ D  := \033[2m
 N  := \033[0m
 endif
 
-.PHONY: all install uninstall purge help akmods-install akmods-uninstall manual-install hook-install
+.PHONY: all install uninstall purge help module-install manual-install hook-install
 
 all: help
 
 help:
 	@printf '$(B)venator -- install targets$(N)\n\n'
 	@printf '$(B)Install:$(N)\n'
-	@printf '  $(G)sudo make hook-install$(N)     [Fedora, recommended] drop a kernel-install hook\n'
-	@printf '                            so every kernel upgrade auto-rebuilds + re-signs.\n'
-	@printf '                            No akmods/rpm-build dependency, no daemon.\n'
-	@printf '  $(G)sudo make akmods-install$(N)   [Fedora] same end result via akmods.service.\n'
-	@printf '                            Requires akmods, kmodtool, rpm-build. Kept as a\n'
-	@printf '                            fallback if hook-install doesn'\''t suit you.\n'
-	@printf '  $(G)sudo make manual-install$(N)   Any distro / kernel. Build, sign, install the\n'
-	@printf '                            kmod for the current kernel. Re-run after each\n'
-	@printf '                            kernel upgrade.\n'
+	@printf '  $(G)sudo make module-install$(N)   [recommended] detect the OS and run the right\n'
+	@printf '                            routine: Fedora -> kernel-install hook (auto-rebuild\n'
+	@printf '                            on every kernel upgrade); Arch/CachyOS -> build for\n'
+	@printf '                            the current kernel. Unsigned by default.\n'
+	@printf '  $(G)sudo make hook-install$(N)     Force the Fedora kernel-install hook routine.\n'
+	@printf '  $(G)sudo make manual-install$(N)   Force a one-shot build for the current kernel.\n'
+	@printf '                            Re-run after each kernel upgrade.\n'
+	@printf '  $(D)... add $(B)SECUREBOOT=1$(N)$(D) to any of the above to sign the module for\n'
+	@printf '      Secure Boot (auto-detects an sbctl/MOK/akmods key).$(N)\n'
 	@printf '  $(G)sudo make install$(N)          Userspace only (CLI / assets / udev / systemd /\n'
 	@printf '                            modules-load.d). Doesn'\''t build the kernel module.\n'
 	@printf '                            All *-install targets above include this.\n\n'
@@ -146,15 +147,13 @@ install:
 	    fi; \
 	fi
 	@# Brief; the comprehensive "Done -- here's what to do next" summary
-	@# is printed by packaging/fedora/install.sh at the very end so
-	@# manual-install / akmods-install give the user a single block of
-	@# instructions at the bottom of their terminal. Running `make
-	@# install` alone is supported but uncommon; tell them what to do.
+	@# is printed by packaging/fedora/install.sh at the very end so the
+	@# *-install targets give the user a single block of instructions at
+	@# the bottom of their terminal. Running `make install` alone is
+	@# supported but uncommon; tell them what to do.
 	@printf '\n$(B)Userspace installed.$(N) '
-	@printf 'For the kernel module + group setup, run one of:\n'
-	@printf '  $(G)sudo make hook-install$(N)     $(D)# Fedora; recommended$(N)\n'
-	@printf '  $(G)sudo make akmods-install$(N)   $(D)# Fedora via akmods; legacy/fallback$(N)\n'
-	@printf '  $(G)sudo make manual-install$(N)   $(D)# any distro; re-run after kernel upgrades$(N)\n'
+	@printf 'For the kernel module + group setup, run:\n'
+	@printf '  $(G)sudo make module-install$(N)   $(D)# detects Fedora vs Arch/CachyOS$(N)\n'
 
 uninstall:
 	@# Stop and disable the systemd user unit for the invoking user.
@@ -231,30 +230,31 @@ uninstall:
 	@printf '  $(D)keymap, custom designs/animations) and ~/.cache/venator/.$(N)\n'
 	@printf '  $(D)akmods signing keys at /etc/pki/akmods/ left in place.$(N)\n'
 
+# Signing is off by default (non-SecureBoot). Pass SECUREBOOT=1 to sign:
+#   sudo make module-install SECUREBOOT=1
+SECUREBOOT       ?=
+SB_FLAG          := $(if $(SECUREBOOT),--secureboot,)
+
+module-install: install
+	@if [ "$$EUID" -ne 0 ]; then \
+	    echo "module-install must be run as root (sudo make module-install)"; \
+	    exit 1; \
+	fi
+	packaging/fedora/install.sh --auto $(SB_FLAG)
+
 hook-install: install
 	@if [ "$$EUID" -ne 0 ]; then \
 	    echo "hook-install must be run as root (sudo make hook-install)"; \
 	    exit 1; \
 	fi
-	packaging/fedora/install.sh --hook
-
-akmods-install: install
-	@if [ "$$EUID" -ne 0 ]; then \
-	    echo "akmods-install must be run as root (sudo make akmods-install)"; \
-	    exit 1; \
-	fi
-	packaging/fedora/install.sh --akmods
+	packaging/fedora/install.sh --hook $(SB_FLAG)
 
 manual-install: install
 	@if [ "$$EUID" -ne 0 ]; then \
 	    echo "manual-install must be run as root (sudo make manual-install)"; \
 	    exit 1; \
 	fi
-	packaging/fedora/install.sh --manual
-
-akmods-uninstall: uninstall
-	@# Back-compat alias. `make uninstall` already does the kernel-side
-	@# removal as well, so this just chains.
+	packaging/fedora/install.sh --manual $(SB_FLAG)
 
 purge: uninstall
 	@# uninstall + nuke per-user data. Useful for clean reinstalls.

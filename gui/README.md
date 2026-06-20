@@ -14,15 +14,16 @@ Currently shipping:
 
 ## Install
 
-The TUI is installed by `sudo make hook-install` / `manual-install` /
-`akmods-install` alongside the CLI. Manual:
+The TUI is installed by `sudo make module-install` (or `hook-install` /
+`manual-install`) alongside the CLI. Manual:
 
 ```bash
 sudo dnf install python3-textual            # Fedora
+sudo pacman -S python-textual               # Arch / CachyOS
 # or: pip install --user textual
 
-cd ~/Workspace/Predator_Sense
-sudo make hook-install
+cd ~/Workspace/Venator
+sudo make module-install
 venator tui
 ```
 

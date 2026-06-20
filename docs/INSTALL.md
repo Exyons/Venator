@@ -1,110 +1,104 @@
 # Install
 
 End-to-end setup for the Predator Helios 16 (PH16-71). Tested on
-Fedora 43 + CachyOS 7.0.5 with Secure Boot **enabled**. Other distros
-should work; the only Fedora-specific detail is the MOK signing
-recipe.
+Fedora 43 + CachyOS 7.0.5 with Secure Boot **enabled**. The kernel-module
+step is **OS-aware**: it detects Fedora vs Arch/CachyOS and runs the right
+build + signing routine.
 
 ## 1. Kernel module
 
-Three methods, all run via `packaging/fedora/install.sh`. Each ends with
-the module loaded, `/etc/modules-load.d/venator.conf` in place
-(auto-load at boot), and the MOK signing handled. **You pick which.**
+One command does the right thing per distro:
 
-- **`hook` (recommended on Fedora)** — installs a `kernel-install` hook
-  that rebuilds + re-signs the module on every kernel upgrade. No
-  akmods, no SRPM, no daemon.
-- **`akmods` (Fedora alternative)** — same auto-rebuild via
-  `akmods.service`. Heavier; kept as a fallback.
-- **`manual` (any distro)** — one-shot build for the current kernel;
-  re-run after each kernel upgrade.
+```bash
+sudo make module-install        # = packaging/fedora/install.sh --auto
+```
 
-### 1a-hook. kernel-install hook (recommended, Fedora)
+`install.sh` reads `/etc/os-release` (`ID` / `ID_LIKE`) and dispatches:
+
+- **Fedora / RHEL-like → `hook`** — installs a `kernel-install` hook that
+  rebuilds + re-signs the module on every kernel upgrade.
+- **Arch / CachyOS / other → `manual`** — one-shot build for the current
+  kernel; re-run after each kernel upgrade.
+
+Force a routine with `sudo make hook-install` or `sudo make manual-install`.
+Either way the module ends up loaded and `/etc/modules-load.d/venator.conf`
+is in place (auto-load at boot).
+
+**Signing is OFF by default** (non-Secure Boot). To sign for Secure Boot,
+add `SECUREBOOT=1` to any target (e.g. `sudo make module-install
+SECUREBOOT=1`) — see [1c. Secure Boot](#1c-secure-boot-signing).
+
+### 1a. Fedora — kernel-install hook
 
 ```bash
 sudo dnf install kernel-devel-$(uname -r) make gcc
 sudo make hook-install                                   # = install.sh --hook
+# signed:  sudo make hook-install SECUREBOOT=1
 ```
 
 What it does:
 
-1. Autodetects/creates an akmods-style signing key under `/etc/pki/akmods/`.
-2. Stages the sources to `/usr/src/venator/`.
-3. Installs the hook to `/etc/kernel/install.d/99-venator.install`.
-4. Builds + signs + installs once for the running kernel, then modprobes.
+1. Stages the sources to `/usr/src/venator/`.
+2. Installs the hook to `/etc/kernel/install.d/99-venator.install`.
+3. Builds + installs once for the running kernel, then modprobes.
+   With `SECUREBOOT=1` it first autodetects/creates an akmods-style signing
+   key under `/etc/pki/akmods/` and signs.
 
 On every future `kernel-install add KVER` (run by the kernel RPM
-scriptlets on upgrade) the hook rebuilds, signs, installs to
-`/lib/modules/$KVER/extra/venator/`, and depmods. It always
+scriptlets on upgrade) the hook rebuilds, (re-signs if a key exists),
+installs to `/lib/modules/$KVER/extra/venator/`, and depmods. It always
 exits 0 so it can never block a kernel install; errors land in
 `journalctl -t venator-hook -b`.
 
-### 1a. Manual (works on any distro / any kernel)
+### 1b. Arch / CachyOS — manual build
 
 ```bash
-sudo dnf install kernel-devel-$(uname -r) make gcc       # or distro equivalent
-sudo make manual-install                                 # = ./packaging/fedora/install.sh
+sudo pacman -S --needed base-devel linux-cachyos-headers   # or linux-headers
+sudo make manual-install                                   # = install.sh --manual
+# signed:  sudo make manual-install SECUREBOOT=1
 ```
 
 What it does:
 
-1. **Autodetect signing keys**, in this order:
-   - any `*.priv` in `/etc/pki/akmods/private/` + any `*.der|*.cer|*.crt`
-     in `/etc/pki/akmods/certs/` (covers the case where akmods has
-     already generated keys for another module like akmod-nvidia — we
-     reuse them, no symlinks);
-   - `/var/lib/shim-signed/mok/MOK.{priv,der}`.
-   You can override with `--mok-priv PATH --mok-cert PATH`, or skip
-   signing entirely with `--no-sign` (only safe if SecureBoot is off).
-2. Builds against `/lib/modules/$(uname -r)/build`.
-3. Signs the `.ko` with the detected key.
-4. Installs to `/lib/modules/$(uname -r)/extra/venator/`.
-5. `depmod -a`, writes modules-load.d, modprobes.
+1. Builds against `/lib/modules/$(uname -r)/build`. CachyOS kernels are
+   **Clang/LLD-built**; the module Makefile detects `CONFIG_CC_IS_CLANG=y`
+   and adds `LLVM=1` automatically (building with GCC against a Clang
+   kernel fails on `-mllvm`, `-mretpoline-external-thunk`, etc.).
+2. Installs to `/lib/modules/$(uname -r)/extra/venator/`, `depmod -a`,
+   writes modules-load.d, modprobes. Unsigned unless `SECUREBOOT=1`.
 
-Trade-off: you re-run this after every kernel upgrade.
+CachyOS doesn't enforce module signatures (`lockdown` is `none`), so the
+unsigned module loads even with Secure Boot enabled. Trade-off: re-run after
+every kernel upgrade. (A pacman hook for automatic rebuilds is planned.)
 
-### 1b. Akmods (Fedora; auto-rebuilds across kernel upgrades)
+### 1c. Secure Boot (signing)
 
-```bash
-sudo dnf install akmods kmodtool rpm-build
-sudo make akmods-install
-```
+Signing is opt-in. Add `SECUREBOOT=1` (or pass `--secureboot` to
+`install.sh`). The installer resolves a key in this order:
 
-What it does:
+1. akmods keys under `/etc/pki/akmods/` (priv + der/cer/crt);
+2. `/var/lib/shim-signed/mok/MOK.{priv,der}`;
+3. **sbctl** `db` keypair at `/var/lib/sbctl/keys/db/db.{key,pem}`.
 
-1. Reuses existing akmods keys if any are in `/etc/pki/akmods/`.
-   Otherwise generates a fresh akmods key and prints the
-   `mokutil --import` line for you to enrol.
-2. Builds **both** the `akmod-venator.noarch.rpm` metapackage
-   and the SRPM from `packaging/fedora/venator-kmod.spec`
-   (kmodtool-driven).
-3. `dnf install`s the akmod-* metapackage. Its `%post` triggers
-   `akmods`, which rebuilds the kmod for the current kernel.
-4. `dnf install`s the resulting `kmod-venator-<ver>-<kver>.x86_64.rpm`.
-5. modules-load.d + modprobe.
-
-After this, `akmods.service` (enabled by default) handles per-kernel
-rebuilds on every upgrade — including the signing, because it reuses
-the same key.
-
-**Caveat:** akmods + kmodtool sometimes choke on non-stock kernels
-(CachyOS, Liquorix, etc.) because the kernel-devel package naming is
-non-standard. If `--akmods` fails for you, fall back to `--manual`.
+It signs the `.ko` via the kernel's `sign-file`. (`sbctl sign` itself only
+handles EFI binaries, not ELF modules — we use its key with `sign-file`.)
+Provide your own with `--mok-priv PATH --mok-cert PATH`. On Fedora `--hook`,
+if no key exists one is generated and the `mokutil --import` line printed for
+you to enroll. If `SECUREBOOT=1` is set but no key is found, the install
+aborts rather than producing a module that won't load.
 
 ### install.sh flags reference
 
 ```
---hook                kernel-install hook; auto-rebuild on every upgrade (recommended)
---manual              (default) build + sign + install for current kernel
---akmods              hand build to akmods; auto-rebuild on upgrade
---mok-priv PATH       explicit MOK private key
---mok-cert PATH       explicit MOK cert (.der / .cer / .crt)
---no-sign             don't sign (SecureBoot off only)
+--auto                (default) detect OS: Fedora -> hook, Arch/other -> manual
+--hook                kernel-install hook; auto-rebuild on every upgrade (Fedora)
+--manual              build + install for current kernel
+--secureboot          sign the module (off by default); resolves a key
+--mok-priv PATH       explicit signing private key (.priv/.key); implies --secureboot
+--mok-cert PATH       explicit signing cert (.der/.cer/.crt/.pem); implies --secureboot
+--no-sign             explicitly disable signing (the default)
 -h, --help            help
 ```
-
-Full play-by-play of the akmods spec + the kmodtool plumbing lives in
-`packaging/fedora/README.md`.
 
 ## 2. Userspace
 
@@ -183,7 +177,7 @@ via `~/.config/systemd/user/venator-restore.service`.
 ## Uninstall
 
 ```bash
-sudo make uninstall            # everything: kernel module (hook/akmods/manual),
+sudo make uninstall            # everything: kernel module (hook or manual),
                                # userspace, units, modules-load.d. Also removes the
                                # kernel-install hook + /usr/src/venator.
 ```

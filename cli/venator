@@ -2315,7 +2315,7 @@ def _write_lb(attr: str, value: str) -> None:
     if not p.exists():
         die(f"sysfs attr {p} doesn't exist — your kernel module is "
             f"older than this CLI. Rebuild + reload it:\n"
-            f"  sudo make akmods-install\n"
+            f"  sudo make module-install\n"
             f"  sudo modprobe -r venator && sudo modprobe venator\n"
             f"  ls /sys/class/predator/lightbar0/   # should now list '{attr}'")
     try:
@@ -2961,7 +2961,7 @@ def cmd_tui(args: argparse.Namespace) -> None:
     ]
     tui_path = next((p for p in candidates if p.is_file()), None)
     if tui_path is None:
-        die("can't find tui.py — install via `sudo make akmods-install` "
+        die("can't find tui.py — install via `sudo make install` "
             "or run from a source checkout (cli/ + gui/ as siblings)")
     extra = getattr(args, "tui_args", []) or []
     try:

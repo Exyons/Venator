@@ -3,17 +3,20 @@
 #
 # venator kernel-module installer.
 #
-# By default this builds the module against the running kernel, signs
-# with your existing MOK (auto-detected), installs to
-# /lib/modules/$(uname -r)/extra/, depmods, and modprobes it. Works on
-# any distro (no RPM required).
+# Default (--auto) detects the OS and runs the right routine:
 #
-# Pass --akmods to instead hand the build off to Fedora's akmods. If
-# kmodtool can produce the akmod-* metapackage you get full per-kernel
-# auto-rebuild. If kmodtool only produces the kmod-* RPM (some kmodtool
-# versions on non-stock kernels do this), we install that directly and
-# stash the SRPM under /usr/src/akmods/ so akmods.service can rebuild
-# from it on the next boot after a kernel upgrade.
+#   Fedora / RHEL-like  -> --hook   : stage sources to /usr/src/venator and
+#                                     drop a kernel-install hook so every
+#                                     kernel upgrade auto-rebuilds + re-signs.
+#   Arch / CachyOS / *  -> --manual : build the module against the running
+#                                     kernel (auto LLVM=1 when the kernel is
+#                                     clang-built), sign (MOK or sbctl db key,
+#                                     auto-detected), install to
+#                                     /lib/modules/$(uname -r)/extra/, depmod,
+#                                     modprobe. Re-run after a kernel upgrade.
+#
+# Both end with the module loaded, /etc/modules-load.d/venator.conf in
+# place, and signing handled. No RPM / akmods dependency.
 
 set -euo pipefail
 
@@ -42,58 +45,62 @@ venator kernel module installer
 Usage: install.sh [METHOD] [SIGNING] [-h]
 
 Methods:
-  --hook     (recommended on Fedora) Stash sources at /usr/src/venator
-                        and drop a kernel-install hook at
+  --auto     (default)  Detect the OS and pick the routine below:
+                          Fedora / RHEL-like  -> --hook
+                          Arch / CachyOS / *  -> --manual
+  --hook     (Fedora)   Stash sources at /usr/src/venator and drop a
+                        kernel-install hook at
                         /etc/kernel/install.d/99-venator.install.
                         Every `kernel-install add` (run automatically by
                         the kernel RPM scriptlets on every upgrade)
-                        re-builds + re-signs the module. No akmods,
-                        no SRPM, no daemon. Then builds once now.
-  --manual   (default)  Build for the current kernel, sign, install to
+                        re-builds + re-signs the module. Then builds now.
+  --manual   (Arch/any) Build for the current kernel (auto LLVM=1 when the
+                        kernel is clang-built), sign, install to
                         /lib/modules/$(uname -r)/extra/, modules-load.d
-                        + modprobe. Works on any distro / any kernel.
-                        Re-run after each kernel upgrade.
-  --akmods              Build + install via akmods. Requires `akmods`
-                        and `rpm-build`. Tries the akmod-* metapackage
-                        flow first; falls back to direct kmod install
-                        if kmodtool didn't produce the metapackage.
+                        + modprobe. Re-run after each kernel upgrade.
 
-Signing (auto-detected if omitted, in this order):
-  1. /etc/pki/akmods/private/*.priv  +  /etc/pki/akmods/certs/*.{der,cer,crt}
-  2. /var/lib/shim-signed/mok/MOK.priv + MOK.der
-
-Signing overrides:
-  --mok-priv PATH       Path to a MOK / signing private key (.priv)
-  --mok-cert PATH       Path to a MOK / signing certificate (.der/.cer/.crt)
-  --no-sign             Don't sign (only safe if SecureBoot is off)
+Secure Boot (signing is OFF by default):
+  --secureboot          Sign the module for Secure Boot. Resolves a signing
+                        key automatically, in this order:
+                          1. /etc/pki/akmods/{private/*.priv,certs/*.der|cer|crt}
+                          2. /var/lib/shim-signed/mok/MOK.{priv,der}
+                          3. /var/lib/sbctl/keys/db/db.{key,pem}  (sbctl)
+                        On Fedora --hook it also generates an akmods key if
+                        none exists and prints the mokutil --import line.
+  --mok-priv PATH       Explicit signing private key (.priv/.key); implies
+                        --secureboot.
+  --mok-cert PATH       Explicit signing cert (.der/.cer/.crt/.pem); implies
+                        --secureboot.
+  --no-sign             Explicitly disable signing (this is the default).
 
 Other:
   --skip-group          Don't create the predator group / set udev perms
   -h, --help            Show this help and exit.
 
 Examples:
-  sudo ./install.sh --hook                     # recommended on Fedora
-  sudo ./install.sh                            # manual + auto-signed
-  sudo ./install.sh --akmods                   # akmods + auto-signed
+  sudo ./install.sh                            # auto-detect OS, no signing
+  sudo ./install.sh --secureboot               # auto-detect OS + sign for SB
+  sudo ./install.sh --hook --secureboot        # Fedora hook, signed
+  sudo ./install.sh --manual                   # build for current kernel, unsigned
   sudo ./install.sh --mok-priv ~/MOK.priv \
-                    --mok-cert ~/MOK.der       # manual + explicit keys
-  sudo ./install.sh --no-sign                  # SecureBoot off
+                    --mok-cert ~/MOK.der       # sign with explicit keys
 EOF
 }
 
-METHOD=manual
+METHOD=auto
 MOK_PRIV=""
 MOK_CERT=""
-DO_SIGN=auto
+DO_SIGN=no            # default: non-SecureBoot (don't sign). --secureboot flips it.
 DO_GROUP=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --akmods)     METHOD=akmods ;;
+        --auto)       METHOD=auto ;;
         --manual)     METHOD=manual ;;
         --hook)       METHOD=hook ;;
-        --mok-priv)   MOK_PRIV="$2"; shift ;;
-        --mok-cert)   MOK_CERT="$2"; shift ;;
+        --secureboot) DO_SIGN=yes ;;
+        --mok-priv)   MOK_PRIV="$2"; DO_SIGN=yes; shift ;;
+        --mok-cert)   MOK_CERT="$2"; DO_SIGN=yes; shift ;;
         --no-sign)    DO_SIGN=no ;;
         --skip-group) DO_GROUP=0 ;;
         -h|--help)    usage; exit 0 ;;
@@ -119,7 +126,47 @@ KERNEL_SRC="$REPO_ROOT/kernel"
 
 INVOKER=${SUDO_USER:-}     # the actual user who ran sudo, if any
 
+# ---------- OS detection -----------------------------------------------------
+
+# Echo a coarse OS family: 'fedora' | 'arch' | 'other'. Reads /etc/os-release
+# ID first, then ID_LIKE so derivatives resolve correctly (CachyOS / EndeavourOS
+# -> arch; Nobara / RHEL / CentOS -> fedora).
+detect_os() {
+    local id="" like=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id=${ID:-}; like=${ID_LIKE:-}
+    fi
+    case " $id $like " in
+        *" fedora "*|*" rhel "*|*" centos "*) echo fedora ;;
+        *" arch "*)                           echo arch ;;
+        *)
+            # Fall back to marker files if os-release was unhelpful.
+            if [ -f /etc/fedora-release ]; then echo fedora
+            elif [ -f /etc/arch-release ]; then echo arch
+            else echo other; fi ;;
+    esac
+}
+
 # ---------- signing key resolution -------------------------------------------
+
+# True (0) only if SecureBoot is verifiably ON. Anything else — disabled,
+# BIOS/legacy boot, or undeterminable — returns non-zero so we don't force
+# signing on systems that don't need it (e.g. CachyOS with SB off, where
+# mokutil isn't even installed).
+secureboot_enabled() {
+    if command -v mokutil >/dev/null 2>&1; then
+        mokutil --sb-state 2>/dev/null | grep -qi 'enabled'
+        return
+    fi
+    # No mokutil: read the EFI SecureBoot variable directly. Its value is
+    # a 5-byte blob whose last byte is 1 when SecureBoot is enabled.
+    local var
+    var=$(find /sys/firmware/efi/efivars -maxdepth 1 -name 'SecureBoot-*' 2>/dev/null | head -1)
+    [ -n "$var" ] || return 1
+    [ "$(od -An -tu1 "$var" 2>/dev/null | tr -s ' ' | sed 's/ $//' | awk '{print $NF}')" = "1" ]
+}
 
 resolve_signing_keys() {
     if [ -n "$MOK_PRIV" ] && [ -n "$MOK_CERT" ]; then
@@ -142,6 +189,16 @@ resolve_signing_keys() {
     if [ -f /var/lib/shim-signed/mok/MOK.priv ] && [ -f /var/lib/shim-signed/mok/MOK.der ]; then
         MOK_PRIV=/var/lib/shim-signed/mok/MOK.priv
         MOK_CERT=/var/lib/shim-signed/mok/MOK.der
+        return
+    fi
+    # 3. sbctl (Arch / CachyOS). sbctl signs EFI binaries with its `db`
+    #    keypair; we reuse that same key/cert to sign the module via
+    #    sign-file. Note: the module loads on these systems regardless of
+    #    signature (CachyOS doesn't lock down modules under SecureBoot),
+    #    but signing with the user's own enrolled db key is the clean path.
+    if [ -f /var/lib/sbctl/keys/db/db.key ] && [ -f /var/lib/sbctl/keys/db/db.pem ]; then
+        MOK_PRIV=/var/lib/sbctl/keys/db/db.key
+        MOK_CERT=/var/lib/sbctl/keys/db/db.pem
         return
     fi
     return 1
@@ -236,23 +293,41 @@ install_manual() {
         fi
     done
 
-    if [ "$DO_SIGN" != "no" ]; then
+    # Signing is OFF by default (non-SecureBoot). --secureboot (or explicit
+    # --mok-* keys) sets DO_SIGN=yes; only then do we resolve a key and sign.
+    if [ "$DO_SIGN" = yes ]; then
         if ! resolve_signing_keys; then
             cat >&2 <<EOF
-${C_RED}xx Can't find a MOK key to sign with.${C_RESET}
+${C_RED}xx --secureboot was requested but no signing key was found.${C_RESET}
    Options:
      - pass --mok-priv PATH --mok-cert PATH
-     - install akmods + run install.sh --akmods (it'll generate keys)
-     - if SecureBoot is off: install.sh --no-sign
+     - Fedora: run with --hook --secureboot (it generates an akmods-style
+               key under /etc/pki/akmods/; enrol it with mokutil --import)
+     - Arch/CachyOS: set up sbctl and create keys (sbctl create-keys),
+               then re-run; we'll sign with /var/lib/sbctl/keys/db/
 EOF
             exit 1
         fi
         step "Signing with $MOK_PRIV"
         info "(cert: $MOK_CERT)"
-        /usr/src/kernels/${KVER}/scripts/sign-file sha256 \
+        # sign-file lives in different places per distro: Fedora ships it
+        # under /usr/src/kernels/$KVER/, Arch/CachyOS under the build tree
+        # at /lib/modules/$KVER/build/. Pick whichever exists.
+        local sign_file=""
+        for cand in \
+            "/lib/modules/${KVER}/build/scripts/sign-file" \
+            "/usr/src/kernels/${KVER}/scripts/sign-file"; do
+            [ -x "$cand" ] && { sign_file="$cand"; break; }
+        done
+        [ -n "$sign_file" ] || \
+            fail "sign-file not found under the kernel build tree for ${KVER}. Install kernel headers/devel."
+        "$sign_file" sha256 \
             "$MOK_PRIV" "$MOK_CERT" "$KERNEL_SRC/venator.ko"
+    elif secureboot_enabled; then
+        warn "SecureBoot is ON but signing is disabled (default)."
+        warn "The module will likely be rejected at load. Re-run with --secureboot."
     else
-        warn "Skipping signing (--no-sign). SecureBoot WILL refuse to load this module."
+        info "Signing disabled (non-SecureBoot mode)."
     fi
 
     step "Installing to /lib/modules/${KVER}/extra/${PKG_NAME}/"
@@ -298,10 +373,15 @@ install_kernel_hook() {
     command -v kernel-install >/dev/null 2>&1 || \
         fail "kernel-install not found. This method is Fedora/systemd-only."
 
-    # Signing: reuse the akmods-managed key pair (the hook script looks
-    # there too). ensure_akmods_keys generates one if neither exists.
-    if [ "$DO_SIGN" != "no" ]; then
+    # Signing is opt-in (--secureboot). When requested, reuse/generate the
+    # akmods-managed key pair (the hook script looks there too). Without it
+    # the hook builds + installs unsigned, fine on non-SecureBoot systems.
+    if [ "$DO_SIGN" = yes ]; then
         ensure_akmods_keys
+    elif secureboot_enabled; then
+        warn "SecureBoot is ON but signing is disabled (default)."
+        warn "The hook will install an unsigned module that won't load."
+        warn "Re-run with --secureboot to set up an akmods signing key."
     fi
 
     # 1. Purge any orphan kmod that would shadow the new build. modprobe
@@ -377,197 +457,21 @@ enrolled in MOK. Run: sudo mokutil --import /etc/pki/akmods/certs/*.der \
 (then reboot to enroll). Or sign the module by hand — see README."
 }
 
-# ---------- akmods install ---------------------------------------------------
-
-install_akmods() {
-    command -v akmods   >/dev/null || fail "akmods not installed: sudo dnf install akmods"
-    command -v rpmbuild >/dev/null || fail "rpm-build not installed: sudo dnf install rpm-build"
-    command -v kmodtool >/dev/null || fail "kmodtool not installed (usually pulled in by akmods)"
-
-    [ "$DO_SIGN" != "no" ] && ensure_akmods_keys
-
-    # 0. Purge any unowned venator.ko under /lib/modules/.
-    #    modprobe searches updates/ before extra/, so an orphan from a
-    #    long-ago `make -C kernel install` can shadow every RPM-installed
-    #    .ko on every reinstall and make the user think nothing changed.
-    purge_orphan_kos() {
-        local mod
-        for mod in $(find /lib/modules -type f -name 'venator.ko' \
-                                       -o -name 'venator.ko.xz' \
-                                       -o -name 'venator.ko.gz' \
-                                       -o -name 'venator.ko.zst' \
-                     2>/dev/null); do
-            if ! rpm -qf "$mod" >/dev/null 2>&1; then
-                step "Removing orphan kmod (not owned by any RPM): $mod"
-                rm -f "$mod"
-            fi
-        done
-    }
-    purge_orphan_kos
-
-    # 1. Build a source tarball akmods expects.
-    local staging=/tmp/venator-akmods-build
-    rm -rf "$staging"
-    mkdir -p "$staging/${PKG_NAME}-${VERSION}"
-    cp "$KERNEL_SRC/venator-main.c" \
-       "$KERNEL_SRC/venator-battery.c" \
-       "$KERNEL_SRC/venator-gaming.c" \
-       "$KERNEL_SRC/venator.h" \
-       "$KERNEL_SRC/Makefile" \
-       "$staging/${PKG_NAME}-${VERSION}/"
-    tar -C "$staging" -czf "$staging/${PKG_NAME}-${VERSION}.tar.gz" "${PKG_NAME}-${VERSION}"
-
-    # 2. Build the akmod-* metapackage AND/OR the per-kernel kmod-* via rpmbuild -ba.
-    #
-    # The spec hard-codes `Release: 1%{?dist}`, which means every rebuild
-    # produces RPMs with the same NEVR. `dnf install -y file.rpm` then
-    # sees "already installed" and silently skips replacing the binary —
-    # so the user thinks the install worked but the kernel module on
-    # disk is still the previous build's. We sidestep this by injecting
-    # a fresh timestamp into the release tag for every rebuild.
-    local rel_stamp
-    rel_stamp="1.$(date +%Y%m%d%H%M%S)"
-    local top
-    top=$(mktemp -d /tmp/predator-rpmbuild.XXXXXX)
-    mkdir -p "$top"/{SOURCES,SPECS,SRPMS,BUILD,RPMS}
-    cp "$staging/${PKG_NAME}-${VERSION}.tar.gz" "$top/SOURCES/"
-    cp "$SCRIPT_DIR/${PKG_NAME}-kmod.spec"      "$top/SPECS/"
-
-    step "Building RPM(s) via kmodtool  (release=${rel_stamp})"
-    rpmbuild --define "_topdir $top" \
-             --define "_smp_mflags -j1" \
-             --define "release_override ${rel_stamp}" \
-             -ba "$top/SPECS/${PKG_NAME}-kmod.spec"
-
-    # 3. Stash the SRPM under /usr/src/akmods/ so akmods.service can rebuild
-    #    it on the next boot after a kernel upgrade.
-    local srpm
-    srpm=$(find "$top/SRPMS" -name "${PKG_NAME}-kmod-*.src.rpm" | head -1 || true)
-    if [ -n "$srpm" ]; then
-        mkdir -p /usr/src/akmods
-        install -m644 "$srpm" "/usr/src/akmods/$(basename "$srpm")"
-        step "SRPM staged at /usr/src/akmods/$(basename "$srpm")"
-    else
-        warn "No SRPM produced; auto-rebuild on kernel upgrade won't work."
-    fi
-
-    # 4. Find the built artefacts. kmodtool *should* produce
-    #    akmod-${PKG_NAME}-*.noarch.rpm + kmod-${PKG_NAME}-*-${KVER}*.rpm,
-    #    but on some setups (CachyOS / non-stock kmodtool) we only get the
-    #    kmod-*. Either is enough to actually run the module.
-    local akmod_rpm kmod_rpm
-    akmod_rpm=$(find "$top/RPMS" -name "akmod-${PKG_NAME}-*.noarch.rpm" | head -1 || true)
-    kmod_rpm=$(find "$top/RPMS"  -name "kmod-${PKG_NAME}-*-${KVER}*.rpm" | head -1 || true)
-    if [ -z "$kmod_rpm" ]; then
-        # Fallback: any kmod RPM produced
-        kmod_rpm=$(find "$top/RPMS" -name "kmod-${PKG_NAME}-*.rpm" | head -1 || true)
-    fi
-
-    # Install policy: always use `rpm -Uvh --force` rather than `dnf
-    # install -y`. dnf will SKIP a file.rpm whose NEVR matches what's
-    # already installed (true even when the file's actual contents
-    # differ), which left the user's old `.ko` on disk after every
-    # reinstall. `rpm -U --force` always replaces files regardless of
-    # NEVR equality. The dependency resolution we lose by not using dnf
-    # doesn't matter here — our RPMs depend only on kernel headers
-    # which are already satisfied by the build environment.
-    install_rpm_force() {
-        local rpmfile="$1"
-        step "Installing $(basename "$rpmfile")"
-        rpm -Uvh --force --nodeps "$rpmfile"
-    }
-
-    if [ -n "$akmod_rpm" ]; then
-        install_rpm_force "$akmod_rpm"
-        # We always prefer the locally-rpmbuilt kmod (it has the fresh
-        # timestamped release tag and matches the .ko we just compiled).
-        # akmods --force is still triggered AFTER for the kernel-upgrade
-        # auto-rebuild path, but its output is for future boots; for
-        # this install we install our own build directly.
-        if [ -n "$kmod_rpm" ]; then
-            install_rpm_force "$kmod_rpm"
-        else
-            step "Forcing akmods rebuild for kernel ${KVER}"
-            akmods --kernels "${KVER}" --force >/dev/null
-            local cached
-            cached=$(find /var/cache/akmods -maxdepth 3 \
-                      -name "kmod-${PKG_NAME}-*-${KVER}*.rpm" 2>/dev/null \
-                      -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-            if [ -n "$cached" ]; then
-                install_rpm_force "$cached"
-            else
-                fail "No kmod RPM to install. Check rpmbuild output under $top/RPMS/."
-            fi
-        fi
-        # Refresh akmods state so the auto-rebuild-on-kernel-upgrade
-        # pipeline knows about the current SRPM. Failure is non-fatal
-        # — the user already has a working kmod on disk.
-        akmods --kernels "${KVER}" >/dev/null 2>&1 || true
-    elif [ -n "$kmod_rpm" ]; then
-        # kmodtool didn't generate the akmod-* metapackage (CachyOS,
-        # older kmodtool, etc.). Build our own from
-        # packaging/fedora/akmod-venator.spec so future kernel
-        # upgrades still get auto-rebuilt by akmods.service.
-        step "kmodtool didn't emit akmod-*; building our own metapackage"
-        cp "$SCRIPT_DIR/akmod-${PKG_NAME}.spec" "$top/SPECS/"
-        if rpmbuild --define "_topdir $top" \
-                    -ba "$top/SPECS/akmod-${PKG_NAME}.spec" >/dev/null; then
-            akmod_rpm=$(find "$top/RPMS" -name "akmod-${PKG_NAME}-*.noarch.rpm" | head -1 || true)
-        fi
-        if [ -n "$akmod_rpm" ]; then
-            install_rpm_force "$akmod_rpm"
-            install_rpm_force "$kmod_rpm"
-            akmods --kernels "${KVER}" >/dev/null 2>&1 || true
-        else
-            warn "Hand-rolled metapackage build failed; falling back to"
-            warn "kmod-only install. Auto-rebuild on kernel upgrade will"
-            warn "require re-running this script."
-            install_rpm_force "$kmod_rpm"
-        fi
-    else
-        fail "Build produced neither akmod-* nor kmod-*. Check $top/RPMS/."
-    fi
-
-    # 5. modules-load.d + load now.
-    install -Dm644 "$REPO_ROOT/modules-load.d/venator.conf" \
-        /etc/modules-load.d/venator.conf
-    install -Dm644 "$REPO_ROOT/modprobe.d/venator-blacklist.conf" \
-        /etc/modprobe.d/venator-blacklist.conf
-
-    # Second orphan sweep + depmod. We did one at the start; do another
-    # here so that if rpm -Uvh somehow left a stale file behind (or the
-    # build process dropped one in updates/), it gets cleaned up before
-    # modprobe gets to pick a winner.
-    purge_orphan_kos
-    depmod -a "${KVER}"
-
-    # Always force a reload so the freshly-installed kmod is the one
-    # actually running — otherwise the loaded module is the old one
-    # and the user thinks the install didn't take.
-    if lsmod | grep -q '^venator'; then
-        step "Reloading venator to pick up the new build"
-        rmmod venator || true
-    fi
-
-    # wmbh-probe holds the same WMBH GUID our gaming/lightbar half binds.
-    # If it's currently loaded the venator bind silently skips.
-    if lsmod | grep -q '^wmbh_probe'; then
-        step "Unloading wmbh_probe (it grabs the WMBH GUID first)"
-        rmmod wmbh_probe || true
-    fi
-
-    modprobe venator && step "Module loaded" \
-        || warn "modprobe failed. If 'Key was rejected by service' \
-appeared: the akmods cert at /etc/pki/akmods/certs/*.der may not be \
-enrolled in MOK. Run: sudo mokutil --import /etc/pki/akmods/certs/*.der \
-(then reboot to enroll). Or sign the module by hand — see README."
-}
-
 # ---------- run -------------------------------------------------------------
+
+# Resolve the OS-specific routine when no method was forced on the CLI.
+#   Fedora (+ RHEL-likes)  -> hook   (kernel-install rebuilds on upgrade)
+#   Arch / CachyOS / other -> manual (build + sbctl-sign for current kernel)
+if [ "$METHOD" = auto ]; then
+    case "$(detect_os)" in
+        fedora) METHOD=hook ;;
+        *)      METHOD=manual ;;
+    esac
+    step "Detected OS family '$(detect_os)' -> using '$METHOD' method"
+fi
 
 case "$METHOD" in
     manual) install_manual ;;
-    akmods) install_akmods ;;
     hook)   install_kernel_hook ;;
     *) usage; exit 2 ;;
 esac
@@ -621,13 +525,21 @@ above for $INVOKER if you ran via sudo).
 EOF
 
 if [ "$METHOD" = manual ]; then
-    info "In --manual mode the module is built only for the CURRENT kernel."
-    info "After a kernel upgrade, re-run this script. For automatic rebuilds"
-    info "on Fedora, run with --hook (preferred) or --akmods."
+    info "Manual mode: the module is built only for the CURRENT kernel."
+    info "Re-run this installer after a kernel upgrade. On Fedora, --hook"
+    info "rebuilds automatically on every upgrade (a pacman hook for"
+    info "Arch/CachyOS is planned)."
 fi
 
 if [ "$METHOD" = hook ]; then
     info "Hook installed at /etc/kernel/install.d/99-${PKG_NAME}.install."
     info "Every future kernel upgrade rebuilds the module automatically."
     info "Inspect with: journalctl -t venator-hook -b"
+fi
+
+if [ "$DO_SIGN" = yes ]; then
+    info "Module signed for Secure Boot."
+else
+    info "Module NOT signed (non-SecureBoot default). If Secure Boot is on,"
+    info "re-run with --secureboot (or: make ... SECUREBOOT=1)."
 fi

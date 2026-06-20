@@ -66,8 +66,9 @@ terminal UI, or systemd at login.
   right power profile come back automatically.
 - **CLI + TUI, one brain** — the CLI and the Textual TUI drive the same
   logic; sysfs stays canonical.
-- **Survives kernel upgrades** — a `kernel-install` hook (or akmods)
-  rebuilds and re‑signs the module on every new kernel.
+- **Survives kernel upgrades** — on Fedora a `kernel-install` hook
+  rebuilds and re‑signs the module on every new kernel (on Arch/CachyOS,
+  re-run the installer after an upgrade).
 
 ## Supported hardware
 
@@ -99,8 +100,10 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 - `python3` (stdlib only for the CLI).
 - Optional: `python3-textual` for the TUI, `python3-pillow` for image
   painting.
-- If **Secure Boot** is on, you'll enroll a signing key once (the
-  installer walks you through it).
+- The module is built **unsigned by default**. If **Secure Boot** enforces
+  module signatures, install with `SECUREBOOT=1` and enroll a key once (the
+  installer walks you through it). See
+  [With Secure Boot](#with-secure-boot).
 
 ## Installation
 
@@ -111,12 +114,66 @@ cd Venator
 # 1) Userspace: CLI, assets, udev rule, systemd units, modules-load.d
 sudo make install
 
-# 2) Kernel module — pick ONE:
-sudo make hook-install      # Fedora, recommended: a kernel-install hook
-                            # rebuilds + re-signs on every kernel upgrade
-sudo make akmods-install    # Fedora alternative, via akmods.service
-sudo make manual-install    # any distro; re-run after each kernel upgrade
+# 2) Kernel module — auto-detects your distro and runs the right routine
+sudo make module-install
 ```
+
+`make module-install` reads `/etc/os-release` and picks the routine that
+fits your distro. **The module is built unsigned by default** (non-Secure
+Boot). If you run Secure Boot, add `SECUREBOOT=1` — see
+[With Secure Boot](#with-secure-boot) below. To force a routine explicitly:
+`sudo make hook-install` (Fedora) or `sudo make manual-install` (Arch / any).
+
+### What runs on your distro
+
+**Fedora (and RHEL-likes)** — installs a **`kernel-install` hook** at
+`/etc/kernel/install.d/99-venator.install`. It stages the sources to
+`/usr/src/venator/` and **rebuilds the module automatically on every kernel
+upgrade**. Build deps: `sudo dnf install kernel-devel make gcc`.
+
+**Arch / CachyOS (and derivatives)** — builds the module for the **current**
+kernel, installs to `/lib/modules/$(uname -r)/extra/`, and loads it. CachyOS
+kernels are **Clang/LLD-built**, so the build switches to `LLVM=1`
+automatically (detected from `CONFIG_CC_IS_CLANG`) — building with GCC against
+a Clang kernel fails with `unrecognized command-line option '-mllvm'` and
+friends. **Re-run `sudo make manual-install` after each kernel upgrade** (a
+pacman hook for auto-rebuild is planned). Build deps:
+`sudo pacman -S --needed base-devel` + headers matching your kernel
+(e.g. `linux-cachyos-headers`, `linux-headers`); `clang lld llvm` if missing.
+
+### Without Secure Boot (default)
+
+Nothing extra to do — `sudo make module-install` builds and loads an
+**unsigned** module. This is the right path when Secure Boot is off (and on
+CachyOS even with Secure Boot on, since its kernel doesn't enforce module
+signatures — `lockdown` is `none`). If Secure Boot *is* enforcing signatures,
+the installer warns you and the module won't load until you use the Secure
+Boot path below.
+
+### With Secure Boot
+
+Add `SECUREBOOT=1` (equivalently, pass `--secureboot` to `install.sh`):
+
+```bash
+sudo make module-install SECUREBOOT=1
+```
+
+This signs the module with an auto-detected key. The installer looks, in
+order, for an **akmods** key (`/etc/pki/akmods/`), a **shim MOK**
+(`/var/lib/shim-signed/mok/`), then an **sbctl** `db` key
+(`/var/lib/sbctl/keys/db/`). Per distro:
+
+- **Fedora** — if no key exists it generates an akmods-style one and prints a
+  `sudo mokutil --import …` line. Run it, reboot, and enroll the key in the
+  MOK Manager screen. The kernel-install hook re-signs on every upgrade.
+- **Arch / CachyOS** — if you manage Secure Boot with **sbctl**, the installer
+  signs with your `db` keypair. Note `sbctl sign` only handles EFI binaries;
+  kernel modules are signed with the kernel's `sign-file` using that same key,
+  which the installer does for you. Provide your own key with
+  `--mok-priv PATH --mok-cert PATH` if you don't use sbctl.
+
+If `SECUREBOOT=1` is set but no key can be found, the install aborts with
+instructions rather than installing a module that won't load.
 
 `make install` also drops two **user** services and enables them for you:
 `venator-restore` (restore at login) and
@@ -128,9 +185,7 @@ the `predator` group so you don't need `sudo` for everyday use:
 sudo usermod -aG predator,input "$USER"   # then log out / back in
 ```
 
-**Secure Boot:** the installer auto‑detects an existing MOK/akmods key,
-or generates one and prints the `mokutil --import` line. Enroll it and
-reboot once. Full details in
+Full details in
 [`packaging/fedora/README.md`](packaging/fedora/README.md) and
 [`docs/INSTALL.md`](docs/INSTALL.md).
 
@@ -359,7 +414,7 @@ gui/             Textual TUI (tui.py) + shared client library (client.py)
 systemd/         restore-at-login, powerwatch, and perms units
 udev/            group-based sysfs permissions
 modules-load.d/  auto-load the module at boot
-packaging/fedora hook / akmods installer + RPM spec
+packaging/fedora OS-aware kernel-module installer (install.sh) + hook
 docs/            sysfs.md, INSTALL.md, MODELS.md
 ```
 
