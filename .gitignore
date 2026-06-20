@@ -39,3 +39,6 @@ __pycache__/
 # Build outputs
 build/
 dist/
+
+# Local codebase-memory MCP artifacts (machine-specific, not committed)
+.codebase-memory/
