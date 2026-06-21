@@ -69,7 +69,27 @@ What it does:
 
 CachyOS doesn't enforce module signatures (`lockdown` is `none`), so the
 unsigned module loads even with Secure Boot enabled. Trade-off: re-run after
-every kernel upgrade. (A pacman hook for automatic rebuilds is planned.)
+every kernel upgrade.
+
+### 1b′. Debian / Ubuntu (and any other distro) — manual build
+
+The `--manual` routine is the **universal one-shot** path; it works on any
+distro with kernel headers + a C toolchain + systemd, not just Arch.
+
+```bash
+# Debian / Ubuntu / Mint / Pop!_OS:
+sudo apt install linux-headers-$(uname -r) build-essential
+sudo ./install.sh                  # auto-detects -> manual on non-Fedora
+```
+
+It builds against `/lib/modules/$(uname -r)/build`, installs to
+`/lib/modules/$(uname -r)/extra/venator/`, `depmod`s, writes modules-load.d,
+and modprobes — identical to the Arch path. If `install.sh` can't find the
+kernel headers it aborts with a per-distro install hint.
+
+**Auto-rebuild on kernel upgrade is currently Fedora-only** (the
+kernel-install hook). On Arch, Debian/Ubuntu, and every other distro, re-run
+`sudo ./install.sh` after a kernel upgrade. A cross-distro DKMS path is planned.
 
 ### 1c. Secure Boot (signing)
 

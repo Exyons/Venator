@@ -20,6 +20,7 @@ terminal UI, or systemd at login.
 - [Features](#features)
 - [Supported hardware](#supported-hardware)
 - [Requirements](#requirements)
+- [Dependencies](#dependencies)
 - [Installation](#installation)
 - [Uninstall](#uninstall)
 - [Usage](#usage)
@@ -98,14 +99,45 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 
 - A recent kernel with `acer-wmi` (Fedora 43+ exposes `platform_profile`,
   fans, and temps out of the box).
-- Kernel headers/`-devel` for your running kernel (to build the module).
-- `python3` (stdlib only for the CLI).
-- Optional: `python3-textual` for the TUI, `python3-pillow` for image
-  painting.
 - The module is built **unsigned by default**. If **Secure Boot** enforces
   module signatures, install with `--secureboot` and enroll a key once (the
   installer walks you through it). See
   [With Secure Boot](#with-secure-boot).
+
+See [Dependencies](#dependencies) for the exact packages to install per distro.
+
+## Dependencies
+
+`install.sh` **never installs packages for you** — install these first, then
+run the installer.
+
+### Build (kernel module)
+
+Kernel headers for your **running** kernel plus a C toolchain:
+
+| Distro | Packages |
+|--------|----------|
+| **Fedora / RHEL-like** | `kernel-devel-$(uname -r)` `make` `gcc` |
+| **Arch / CachyOS** | `base-devel`, `linux-headers` (or `linux-cachyos-headers`); plus `clang` `lld` `llvm` for CachyOS's Clang/LLD-built kernels |
+| **Debian / Ubuntu** (Mint, Pop!_OS, …) | `linux-headers-$(uname -r)` `build-essential` |
+| **Any other distro** | your distro's kernel-headers package for `$(uname -r)`, plus `make` and `gcc` |
+
+### Runtime (CLI + TUI)
+
+- `python3` — the CLI uses the **standard library only**, nothing else needed.
+- Optional `python3-textual` — the terminal UI (`venator tui`).
+- Optional `python3-pillow` — image painting (`venator rgb image`).
+
+Package names: Fedora `python3 python3-textual python3-pillow` · Arch
+`python python-textual python-pillow` · Debian/Ubuntu
+`python3 python3-textual python3-pil`.
+
+### Secure Boot (only with `--secureboot`)
+
+- `mokutil` to enroll a signing key (Fedora, Debian/Ubuntu), and/or
+- `sbctl` (Arch/CachyOS) or an existing akmods / shim-MOK key.
+
+Details in [With Secure Boot](#with-secure-boot).
 
 ## Installation
 
@@ -135,17 +167,27 @@ run Secure Boot, add `--secureboot` — see
 **Fedora (and RHEL-likes)** — installs a **`kernel-install` hook** at
 `/etc/kernel/install.d/99-venator.install`. It stages the sources to
 `/usr/src/venator/` and **rebuilds the module automatically on every kernel
-upgrade**. Build deps: `sudo dnf install kernel-devel make gcc`.
+upgrade**.
 
 **Arch / CachyOS (and derivatives)** — builds the module for the **current**
 kernel, installs to `/lib/modules/$(uname -r)/extra/`, and loads it. CachyOS
 kernels are **Clang/LLD-built**, so the build switches to `LLVM=1`
 automatically (detected from `CONFIG_CC_IS_CLANG`) — building with GCC against
 a Clang kernel fails with `unrecognized command-line option '-mllvm'` and
-friends. **Re-run `sudo ./install.sh --manual` after each kernel upgrade** (a
-pacman hook for auto-rebuild is planned). Build deps:
-`sudo pacman -S --needed base-devel` + headers matching your kernel
-(e.g. `linux-cachyos-headers`, `linux-headers`); `clang lld llvm` if missing.
+friends. **Re-run `sudo ./install.sh --manual` after each kernel upgrade.**
+
+**Debian / Ubuntu (and Mint, Pop!_OS, …)** — same one-shot build for the
+**current** kernel, installed to `/lib/modules/$(uname -r)/extra/` and loaded.
+**Re-run `sudo ./install.sh` after each kernel upgrade.**
+
+**Any other distro** — works wherever you have the kernel headers for your
+running kernel, a C toolchain (`make` + `gcc`, or `clang`/`lld` for a Clang
+kernel), and systemd. The installer falls back to the same one-shot build.
+
+Build packages for each are listed under [Dependencies](#dependencies).
+Auto-rebuild on kernel upgrade is currently **Fedora-only** (via the
+kernel-install hook); a DKMS path for the other distros is planned. Until
+then, re-run the installer after a kernel upgrade.
 
 ### Without Secure Boot (default)
 
@@ -195,9 +237,7 @@ the `venator` group so you don't need `sudo` for everyday use:
 sudo usermod -aG venator,input "$USER"   # then log out / back in
 ```
 
-Full details in
-[`packaging/fedora/README.md`](packaging/fedora/README.md) and
-[`docs/INSTALL.md`](docs/INSTALL.md).
+Full details in [`docs/INSTALL.md`](docs/INSTALL.md).
 
 ## Uninstall
 
@@ -475,6 +515,13 @@ Also on the list: broader **model coverage**.
   `venator power --detach-ppd`.
 - **Hook built nothing after a kernel upgrade:** install matching
   `kernel-devel` and check `journalctl -t venator-hook -b`.
+- **`unrecognized command-line option '-mllvm'` (and friends) on CachyOS:**
+  the kernel is Clang/LLD-built and the module tried to build with GCC. The
+  installer auto-detects this and passes `LLVM=1`; if you build by hand, run
+  `make -C kernel LLVM=1`. Needs `clang lld llvm` installed.
+- **Kernel headers missing:** `install.sh` aborts with a per-distro install
+  hint. Install the headers for your *running* kernel (see
+  [Dependencies](#dependencies)) and re-run.
 
 ## Contributing
 

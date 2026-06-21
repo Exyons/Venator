@@ -5,13 +5,14 @@
 #
 # Default (--auto) detects the OS and runs the right routine:
 #
-#   Fedora / RHEL-like  -> --hook   : stage sources to /usr/src/venator and
-#                                     drop a kernel-install hook so every
+#   Fedora / RHEL-like        -> --hook   : stage sources to /usr/src/venator
+#                                     and drop a kernel-install hook so every
 #                                     kernel upgrade auto-rebuilds + re-signs.
-#   Arch / CachyOS / *  -> --manual : build the module against the running
-#                                     kernel (auto LLVM=1 when the kernel is
-#                                     clang-built), sign (MOK or sbctl db key,
-#                                     auto-detected), install to
+#   Arch / Debian / Ubuntu /  -> --manual : universal one-shot. Build the
+#   any other distro                  module against the running kernel (auto
+#                                     LLVM=1 when the kernel is clang-built),
+#                                     sign (MOK / sbctl / akmods key, auto-
+#                                     detected), install to
 #                                     /lib/modules/$(uname -r)/extra/, depmod,
 #                                     modprobe. Re-run after a kernel upgrade.
 #
@@ -46,18 +47,21 @@ Usage: install.sh [METHOD] [SIGNING] [-h]
 
 Methods:
   --auto     (default)  Detect the OS and pick the routine below:
-                          Fedora / RHEL-like  -> --hook
-                          Arch / CachyOS / *  -> --manual
+                          Fedora / RHEL-like           -> --hook
+                          Arch / Debian / Ubuntu / *   -> --manual
   --hook     (Fedora)   Stash sources at /usr/src/venator and drop a
                         kernel-install hook at
                         /etc/kernel/install.d/99-venator.install.
                         Every `kernel-install add` (run automatically by
                         the kernel RPM scriptlets on every upgrade)
                         re-builds + re-signs the module. Then builds now.
-  --manual   (Arch/any) Build for the current kernel (auto LLVM=1 when the
-                        kernel is clang-built), sign, install to
-                        /lib/modules/$(uname -r)/extra/, modules-load.d
-                        + modprobe. Re-run after each kernel upgrade.
+  --manual   (any)      Universal one-shot: build for the current kernel
+                        (auto LLVM=1 when the kernel is clang-built), sign,
+                        install to /lib/modules/$(uname -r)/extra/,
+                        modules-load.d + modprobe. Works on any distro with
+                        kernel headers + a C toolchain (Arch, Debian, Ubuntu,
+                        Mint, openSUSE, ...). Re-run after each kernel upgrade
+                        (only Fedora --hook auto-rebuilds).
 
 Secure Boot (signing is OFF by default):
   --secureboot          Sign the module for Secure Boot. Resolves a signing
@@ -128,21 +132,25 @@ REPO_ROOT="$SCRIPT_DIR"
 KERNEL_SRC="$REPO_ROOT/kernel"
 HOOK_SRC="$REPO_ROOT/packaging/fedora/99-${PKG_NAME}.install"
 
-# Uninstall needs neither kernel sources nor headers — skip those checks.
+# Uninstall needs neither kernel sources nor headers — skip that check.
+# (The kernel-headers/build-tree precondition is checked later by
+# require_headers, once detect_os is defined, so we can print a distro-aware
+# hint.)
 if [ "$METHOD" != uninstall ]; then
     [ -f "$KERNEL_SRC/venator-main.c" ] || \
         fail "Can't find kernel sources at $KERNEL_SRC/. Run install.sh from a clone of the repo."
-    [ -d "/lib/modules/${KVER}/build" ] || \
-        fail "Missing kernel headers/devel for the running kernel (${KVER}). Install the matching kernel-devel package and re-run."
 fi
 
 INVOKER=${SUDO_USER:-}     # the actual user who ran sudo, if any
 
 # ---------- OS detection -----------------------------------------------------
 
-# Echo a coarse OS family: 'fedora' | 'arch' | 'other'. Reads /etc/os-release
-# ID first, then ID_LIKE so derivatives resolve correctly (CachyOS / EndeavourOS
-# -> arch; Nobara / RHEL / CentOS -> fedora).
+# Echo a coarse OS family: 'fedora' | 'arch' | 'debian' | 'other'. Reads
+# /etc/os-release ID first, then ID_LIKE so derivatives resolve correctly
+# (CachyOS / EndeavourOS -> arch; Nobara / RHEL / CentOS -> fedora;
+# Ubuntu / Mint / Pop!_OS -> debian). The family is only used to pick the
+# routine (fedora -> hook, everything else -> manual) and to print accurate
+# dependency hints; the manual build itself is distro-agnostic.
 detect_os() {
     local id="" like=""
     if [ -r /etc/os-release ]; then
@@ -153,12 +161,40 @@ detect_os() {
     case " $id $like " in
         *" fedora "*|*" rhel "*|*" centos "*) echo fedora ;;
         *" arch "*)                           echo arch ;;
+        *" debian "*|*" ubuntu "*)            echo debian ;;
         *)
             # Fall back to marker files if os-release was unhelpful.
             if [ -f /etc/fedora-release ]; then echo fedora
             elif [ -f /etc/arch-release ]; then echo arch
+            elif [ -f /etc/debian_version ]; then echo debian
             else echo other; fi ;;
     esac
+}
+
+# ---------- kernel-headers precondition --------------------------------------
+
+# Print the package-install command that gets kernel headers + a C toolchain
+# for the detected distro. This is GUIDANCE ONLY — the installer never runs a
+# package manager itself. The full, canonical dependency list lives in the
+# README's "Dependencies" section.
+headers_hint() {
+    case "$(detect_os)" in
+        fedora) echo "sudo dnf install kernel-devel-$(uname -r) make gcc" ;;
+        arch)   echo "sudo pacman -S --needed base-devel linux-headers   # or linux-cachyos-headers" ;;
+        debian) echo "sudo apt install linux-headers-$(uname -r) build-essential" ;;
+        *)      echo "install your distro's kernel headers for ${KVER} plus a C toolchain (make, gcc)" ;;
+    esac
+}
+
+# The module build needs /lib/modules/$KVER/build (the kernel headers / build
+# tree for the running kernel). Fail with a distro-aware hint if it's missing.
+require_headers() {
+    [ -d "/lib/modules/${KVER}/build" ] && return 0
+    warn "Missing kernel headers / build tree for the running kernel (${KVER})."
+    info "Install them, for example:"
+    info "    $(headers_hint)"
+    info "Full dependency list: see the 'Dependencies' section in the README."
+    fail "Kernel headers are required to build the module."
 }
 
 # ---------- signing key resolution -------------------------------------------
@@ -322,12 +358,14 @@ EOF
         fi
         step "Signing with $MOK_PRIV"
         info "(cert: $MOK_CERT)"
-        # sign-file lives in different places per distro: Fedora ships it
-        # under /usr/src/kernels/$KVER/, Arch/CachyOS under the build tree
-        # at /lib/modules/$KVER/build/. Pick whichever exists.
+        # sign-file lives in different places per distro. The build-tree path
+        # is the most portable (Arch/CachyOS, and Debian/Ubuntu where build/
+        # symlinks to /usr/src/linux-headers-$KVER/). Fedora ships it under
+        # /usr/src/kernels/$KVER/. Try them in order of portability.
         local sign_file=""
         for cand in \
             "/lib/modules/${KVER}/build/scripts/sign-file" \
+            "/usr/src/linux-headers-${KVER}/scripts/sign-file" \
             "/usr/src/kernels/${KVER}/scripts/sign-file"; do
             [ -x "$cand" ] && { sign_file="$cand"; break; }
         done
@@ -549,8 +587,8 @@ if [ "$METHOD" = uninstall ]; then
 fi
 
 # Resolve the OS-specific routine when no method was forced on the CLI.
-#   Fedora (+ RHEL-likes)  -> hook   (kernel-install rebuilds on upgrade)
-#   Arch / CachyOS / other -> manual (build + sbctl-sign for current kernel)
+#   Fedora (+ RHEL-likes)            -> hook   (kernel-install rebuilds on upgrade)
+#   Arch / Debian / Ubuntu / other   -> manual (one-shot build for current kernel)
 if [ "$METHOD" = auto ]; then
     case "$(detect_os)" in
         fedora) METHOD=hook ;;
@@ -558,6 +596,9 @@ if [ "$METHOD" = auto ]; then
     esac
     step "Detected OS family '$(detect_os)' -> using '$METHOD' method"
 fi
+
+# Both hook and manual build the module, so the kernel headers must be present.
+require_headers
 
 # Userspace install (CLI, assets, udev rule, systemd units, modules-load.d,
 # keymap seed). This is `make install`. Running install.sh standalone should
@@ -639,10 +680,10 @@ above for $INVOKER if you ran via sudo).
 EOF
 
 if [ "$METHOD" = manual ]; then
-    info "Manual mode: the module is built only for the CURRENT kernel."
-    info "Re-run this installer after a kernel upgrade. On Fedora, --hook"
-    info "rebuilds automatically on every upgrade (a pacman hook for"
-    info "Arch/CachyOS is planned)."
+    info "Manual mode (the universal one-shot path): the module is built only"
+    info "for the CURRENT kernel. Re-run this installer after a kernel upgrade."
+    info "Only Fedora (--hook) rebuilds automatically; auto-rebuild for other"
+    info "distros (DKMS) is planned."
 fi
 
 if [ "$METHOD" = hook ]; then
