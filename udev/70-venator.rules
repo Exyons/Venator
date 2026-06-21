@@ -9,10 +9,14 @@
 #   - sudo groupadd -r venator
 #   - sudo usermod -aG venator $USER
 #   - sudo udevadm control --reload
-#   - sudo udevadm trigger -s venator
+#   - sudo udevadm trigger -s venator -c add
 #   - newgrp venator    (or log out / back in for the new group to take)
+#
+# Match both "add" and "change": the kernel emits "add" when the module binds
+# the device at load, and `udevadm trigger` defaults to "change". Matching both
+# means a manual re-trigger (without -c add) still re-applies the perms.
 
-ACTION=="add", SUBSYSTEM=="venator", \
+ACTION=="add|change", SUBSYSTEM=="venator", \
     RUN+="/bin/sh -c '\
         cd /sys$env{DEVPATH} 2>/dev/null && \
         chgrp venator mode color brightness effect_id apply frame \

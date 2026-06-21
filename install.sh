@@ -280,18 +280,20 @@ ensure_akmods_keys() {
 setup_group_and_udev() {
     [ "$DO_GROUP" -eq 1 ] || return 0
 
-    if ! getent group venator >/dev/null 2>&1; then
+    if getent group venator >/dev/null 2>&1; then
+        step "Group 'venator' already exists (gid $(getent group venator | cut -d: -f3))"
+    else
         step "Creating 'venator' group"
         groupadd -r venator
     fi
 
     if [ -n "$INVOKER" ] && [ "$INVOKER" != "root" ]; then
         local added=0
-        if ! id -nG "$INVOKER" 2>/dev/null | tr ' ' '\n' | grep -qx venator; then
+        if id -nG "$INVOKER" 2>/dev/null | tr ' ' '\n' | grep -qx venator; then
+            step "$INVOKER is already in the 'venator' group (no change)"
+        else
             step "Adding $INVOKER to 'venator' group"
             usermod -aG venator "$INVOKER"; added=1
-        else
-            step "$INVOKER already in 'venator' group"
         fi
         # The background worker reads /dev/input/by-path/*-event-kbd to
         # implement wake-on-keypress for our custom designs / animations.
@@ -313,12 +315,22 @@ setup_group_and_udev() {
     udevadm control --reload
 
     if [ -d /sys/class/venator ]; then
-        step "Triggering udev for venator subsystem"
-        udevadm trigger -s venator
-        sleep 0.2  # give udev a moment to apply chgrp/chmod
-        local mode_perm
-        mode_perm=$(stat -c '%a %G' /sys/class/venator/keyboard0/mode 2>/dev/null || true)
-        info "/sys/class/venator/keyboard0/mode  ->  $mode_perm  (want: 664 venator)"
+        # The rule matches ACTION=="add". `udevadm trigger` defaults to the
+        # "change" action, which would NOT match — so we must force "add"
+        # (-c add), otherwise the chgrp/chmod never runs and the sysfs attrs
+        # stay root:root (permission denied for the group).
+        step "Triggering udev (add) for venator subsystem"
+        udevadm trigger -s venator -c add
+        udevadm settle 2>/dev/null || sleep 0.3
+        local mode_grp
+        mode_grp=$(stat -c '%G' /sys/class/venator/keyboard0/mode 2>/dev/null || true)
+        if [ "$mode_grp" = venator ]; then
+            info "sysfs perms applied: /sys/class/venator/keyboard0/mode -> group venator (664)"
+        else
+            warn "udev rule didn't apply (mode is group '$mode_grp', want 'venator')."
+            warn "Try: sudo udevadm control --reload && sudo udevadm trigger -s venator -c add"
+            warn "Or reload the module: sudo modprobe -r venator && sudo modprobe venator"
+        fi
     fi
 }
 
