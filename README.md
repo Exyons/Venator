@@ -108,8 +108,7 @@ See [Dependencies](#dependencies) for the exact packages to install per distro.
 
 ## Dependencies
 
-`install.sh` **never installs packages for you** — install these first, then
-run the installer.
+Install these before running the installer.
 
 ### Build (kernel module)
 
@@ -127,10 +126,6 @@ Kernel headers for your **running** kernel plus a C toolchain:
 - `python3` — the CLI uses the **standard library only**, nothing else needed.
 - Optional `python3-textual` — the terminal UI (`venator tui`).
 - Optional `python3-pillow` — image painting (`venator rgb image`).
-
-Package names: Fedora `python3 python3-textual python3-pillow` · Arch
-`python python-textual python-pillow` · Debian/Ubuntu
-`python3 python3-textual python3-pil`.
 
 ### Secure Boot (only with `--secureboot`)
 
@@ -150,13 +145,15 @@ cd Venator
 sudo ./install.sh
 ```
 
-`install.sh` reads `/etc/os-release` and picks the routine that fits your
-distro, installs the userspace half, builds + loads the kernel module,
-creates the `venator` group, and enables the user services — all in one
-shot. **The module is built unsigned by default** (non-Secure Boot). If you
-run Secure Boot, add `--secureboot` — see
-[With Secure Boot](#with-secure-boot) below. To force a routine explicitly:
-`sudo ./install.sh --hook` (Fedora) or `sudo ./install.sh --manual` (Arch / any).
+With no flag, `install.sh` runs `--auto`: it reads `/etc/os-release`, picks the
+routine that fits your distro, installs the userspace half, builds + loads the
+kernel module, creates the `venator` group, and enables the user services — all
+in one shot. **Auto-detection covers Fedora, Arch, and Debian families** — just
+run `sudo ./install.sh`. On **any other distro**, run `sudo ./install.sh
+--manual` for the universal one-shot build.
+
+**The module is built unsigned by default** (non-Secure Boot). If you run Secure
+Boot, add `--secureboot` — see [With Secure Boot](#with-secure-boot) below.
 
 > The `make` targets still work as thin wrappers — `sudo make module-install`
 > (= `./install.sh`), `hook-install`, `manual-install`, with `SECUREBOOT=1`
@@ -164,25 +161,34 @@ run Secure Boot, add `--secureboot` — see
 
 ### What runs on your distro
 
-**Fedora (and RHEL-likes)** — installs a **`kernel-install` hook** at
+The default `--auto` recognizes three families and runs the matching routine —
+**no flag needed** for any of them; just `sudo ./install.sh`. Only **other,
+unrecognized distros** need an explicit `--manual`.
+
+**Fedora (and RHEL-likes)** — `--auto` picks the **hook** routine: installs a
+**`kernel-install` hook** at
 `/etc/kernel/install.d/99-venator.install`. It stages the sources to
 `/usr/src/venator/` and **rebuilds the module automatically on every kernel
 upgrade**.
 
-**Arch / CachyOS (and derivatives)** — builds the module for the **current**
-kernel, installs to `/lib/modules/$(uname -r)/extra/`, and loads it. CachyOS
-kernels are **Clang/LLD-built**, so the build switches to `LLVM=1`
-automatically (detected from `CONFIG_CC_IS_CLANG`) — building with GCC against
-a Clang kernel fails with `unrecognized command-line option '-mllvm'` and
-friends. **Re-run `sudo ./install.sh --manual` after each kernel upgrade.**
+**Arch / CachyOS (and derivatives)** — `--auto` picks the **manual** one-shot:
+builds the module for the **current** kernel, installs to
+`/lib/modules/$(uname -r)/extra/`, and loads it. CachyOS kernels are
+**Clang/LLD-built**, so the build switches to `LLVM=1` automatically (detected
+from `CONFIG_CC_IS_CLANG`) — building with GCC against a Clang kernel fails with
+`unrecognized command-line option '-mllvm'` and friends. **Re-run
+`sudo ./install.sh` after each kernel upgrade.**
 
-**Debian / Ubuntu (and Mint, Pop!_OS, …)** — same one-shot build for the
-**current** kernel, installed to `/lib/modules/$(uname -r)/extra/` and loaded.
-**Re-run `sudo ./install.sh` after each kernel upgrade.**
+**Debian / Ubuntu (and Mint, Pop!_OS, …)** — `--auto` picks the same **manual**
+one-shot build for the **current** kernel, installed to
+`/lib/modules/$(uname -r)/extra/` and loaded. **Re-run `sudo ./install.sh` after
+each kernel upgrade.**
 
-**Any other distro** — works wherever you have the kernel headers for your
-running kernel, a C toolchain (`make` + `gcc`, or `clang`/`lld` for a Clang
-kernel), and systemd. The installer falls back to the same one-shot build.
+**Any other distro** — not auto-detected, so run `sudo ./install.sh --manual`
+explicitly. Works wherever you have the kernel headers for your running kernel,
+a C toolchain (`make` + `gcc`, or `clang`/`lld` for a Clang kernel), and
+systemd — the same one-shot build. **Re-run `sudo ./install.sh --manual` after
+each kernel upgrade.**
 
 Build packages for each are listed under [Dependencies](#dependencies).
 Auto-rebuild on kernel upgrade is currently **Fedora-only** (via the
