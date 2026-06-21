@@ -150,10 +150,13 @@ install:
 	@# is printed by ./install.sh at the very end so the
 	@# *-install targets give the user a single block of instructions at
 	@# the bottom of their terminal. Running `make install` alone is
-	@# supported but uncommon; tell them what to do.
-	@printf '\n$(B)Userspace installed.$(N) '
-	@printf 'For the kernel module + group setup, run:\n'
-	@printf '  $(G)sudo make module-install$(N)   $(D)# detects Fedora vs Arch/CachyOS$(N)\n'
+	@# supported but uncommon; tell them what to do — but stay quiet when
+	@# ./install.sh drove this (it prints its own final summary).
+	@if [ -z "$$VENATOR_FROM_INSTALLER" ]; then \
+	    printf '\n$(B)Userspace installed.$(N) '; \
+	    printf 'For the kernel module + group setup, run:\n'; \
+	    printf '  $(G)sudo make module-install$(N)   $(D)# detects Fedora vs Arch/CachyOS$(N)\n'; \
+	fi
 
 uninstall:
 	@# Stop and disable the systemd user unit for the invoking user.

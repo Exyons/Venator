@@ -623,7 +623,9 @@ install_userspace() {
     [ "${VENATOR_SKIP_USERSPACE:-0}" = 1 ] && return 0
     command -v make >/dev/null 2>&1 || { warn "make not found; skipping userspace install (CLI/units/udev rule)"; return 0; }
     step "Installing userspace (CLI, udev rule, systemd units) via make install"
-    make -C "$REPO_ROOT" install || warn "make install failed; CLI/units may be missing"
+    # VENATOR_FROM_INSTALLER silences make install's "run sudo make
+    # module-install" footer — install.sh prints its own final summary.
+    VENATOR_FROM_INSTALLER=1 make -C "$REPO_ROOT" install || warn "make install failed; CLI/units may be missing"
 }
 install_userspace
 
