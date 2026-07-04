@@ -94,6 +94,7 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 | PH16‑71  | Fedora 43 | `7.0.9-105.fc43.x86_64`   | 1.16 |
 | PH16‑71  | Fedora 43 | `7.0.10-101.fc43.x86_64`  | 1.16 |
 | PH16‑71  | CachyOS   | `7.0.12-1-cachyos`        | 1.16 |
+| PH16-71  | CachyOS   | `7.1.2-3-cachyos`         | 1.16 |
 
 ## Requirements
 
@@ -279,7 +280,7 @@ venator tui
 A [Textual](https://textual.textualize.io/) UI with a live keyboard
 preview and tabs for **Home / Keyboard / Power / Battery / Lightbar /
 Unified**. Every tab scrolls, the Power tab is split into power controls
-(left) and live fans/temps (right). Works over SSH.
+(left) and live fans/temps (right).
 
 ### Keyboard RGB
 
