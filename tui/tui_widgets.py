@@ -268,7 +268,7 @@ class NeonBanner(Static):
     # Specular sweep: ~0.18 passes/sec at 12 fps. Slow + cheap (~6 lines
     # of figlet) so it reads as a gloss travelling across the wordmark,
     # not a strobe.
-    SHIMMER_HZ = 12
+    SHIMMER_HZ = 8
     SHIMMER_SPEED = 0.18
 
     def __init__(self, text: str = "VENATOR", subtitle: str = "", *, id=None):
@@ -281,6 +281,10 @@ class NeonBanner(Static):
         self.set_interval(1.0 / self.SHIMMER_HZ, self._tick)
 
     def _tick(self) -> None:
+        # Don't animate (or wake the compositor) while we're on a hidden tab:
+        # a widget in an inactive TabPane has zero layout area.
+        if self.size.area == 0:
+            return
         import time
         self._phase = (time.monotonic() * self.SHIMMER_SPEED) % 1.0
         self.refresh()
@@ -530,7 +534,7 @@ class KeyboardView(Static):
     as blank gaps (so the preview looks like a sparse keyboard, not a
     grid of dots).
     """
-    POLL_INTERVAL_S = 0.20
+    POLL_INTERVAL_S = 0.5
     CELL_WIDTH = 5
 
     selected = reactive(None, layout=False)
@@ -544,15 +548,32 @@ class KeyboardView(Static):
         # (controls vertical/horizontal child layout). Don't shadow it.
         self.kbd_layout = layout
         self.frame_rgb = [(0, 0, 0)] * layout.num_cells
+        self._last_key = None   # (raw frame bytes, brightness) of the last paint
 
     def on_mount(self) -> None:
         self.set_interval(self.POLL_INTERVAL_S, self._poll)
         self._poll()
 
+    def on_resize(self, event=None) -> None:
+        # Becoming visible (hidden tab -> shown) resizes us from 0 area.
+        # Force the next poll to repaint with fresh data promptly.
+        self._last_key = None
+
     def _poll(self) -> None:
+        # Skip entirely while on a hidden tab (zero layout area): no sysfs
+        # read, no rebuild, no repaint. Resumes on tab switch via on_resize.
+        if self.size.area == 0:
+            return
         raw = self.client.get_frame()
-        rgb = frame_to_rgb(raw, self.kbd_layout.num_cells)
         bright = max(0, min(255, self.client.get_brightness()))
+        # Nothing changed since the last paint? Then the 132-cell rebuild +
+        # refresh() would be wasted work — the common idle case (static
+        # keyboard, no animation running). Bail before touching anything.
+        key = (raw, bright)
+        if key == self._last_key:
+            return
+        self._last_key = key
+        rgb = frame_to_rgb(raw, self.kbd_layout.num_cells)
         scale = bright / 255.0 if bright > 0 else 1.0
         rgb = [(int(r * scale), int(g * scale), int(b * scale)) for r, g, b in rgb]
         self.frame_rgb = rgb
@@ -624,12 +645,16 @@ class StatusBar(Static):
     def __init__(self, client: PredatorSenseClient, *, id=None):
         super().__init__(id=id)
         self.client = client
+        self._last = None
 
     def on_mount(self) -> None:
         self.set_interval(0.5, self._refresh)
         self._refresh()
 
     def _refresh(self) -> None:
+        # Skip while on a hidden tab.
+        if self.size.area == 0:
+            return
         try:
             mode = self.client.get_mode() or "?"
             color = self.client.get_color() or "—"
@@ -638,10 +663,15 @@ class StatusBar(Static):
         except Exception as e:
             self.update(f"[bold red]error:[/] {e}")
             return
-        self.update(
+        markup = (
             f"[b]{dev}[/]   mode=[cyan]{mode}[/]  colour=[magenta]{color}[/]  "
             f"brightness=[yellow]{bright}[/]/255"
         )
+        # Only repaint when something actually changed.
+        if markup == self._last:
+            return
+        self._last = markup
+        self.update(markup)
 
 
 # -------------------------------------------------------------- ButtonGrid
@@ -700,7 +730,7 @@ class FanSpinner(Static):
     WIDTH    = 23
     HEIGHT   = 11
     BLADES   = 6           # MUST be even — see note below
-    REFRESH_HZ = 10        # 100 ms per frame; smoother than 20 Hz on most terms
+    REFRESH_HZ = 8         # 125 ms per frame; smooth enough, ~20% less CPU
 
     # MUST be even. With an odd blade count the alternating
     # light/dark scheme places two same-coloured wedges next to each
@@ -750,6 +780,12 @@ class FanSpinner(Static):
         self.set_interval(1.0 / self.REFRESH_HZ, self._tick)
 
     def _tick(self) -> None:
+        # Don't spin (or wake the compositor) while off-screen: a widget on
+        # a hidden tab has zero layout area. This stops the two spinners on
+        # the Power tab from rendering when you're looking at another tab.
+        if self.size.area == 0:
+            self._last_tick_ts = None
+            return
         import time as _t
         now = _t.monotonic()
         if self._last_tick_ts is None:

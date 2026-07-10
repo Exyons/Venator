@@ -188,17 +188,57 @@ class PredatorSenseApp(
         # their value clobbered every 5s.
         self._refresh_lightbar(sync_inputs=True)
         self._refresh_unified()
-        self.set_interval(1.0, self._refresh_thermal)
-        self.set_interval(2.0, self._refresh_battery)
-        self.set_interval(2.0, self._refresh_home)
-        self.set_interval(3.0, self._refresh_power)
-        self.set_interval(5.0, self._refresh_lightbar)
+        # Only run a tab's recurring refresh while that tab is actually
+        # visible — reading sysfs + updating widgets for hidden tabs every
+        # 1-5s is pure waste (and part of what made the UI stutter). The
+        # one-time population above still primed every tab; switching to a
+        # tab re-runs its refresh immediately (see on_tabbed_content_...).
+        self.set_interval(1.0, self._gated("power",   self._refresh_thermal))
+        self.set_interval(2.0, self._gated("battery", self._refresh_battery))
+        self.set_interval(2.0, self._gated("home",    self._refresh_home))
+        self.set_interval(3.0, self._gated("power",   self._refresh_power))
+        self.set_interval(5.0, self._gated("lightbar", self._refresh_lightbar))
         # Refresh the home tagline at the next local midnight so the
         # day-rotating phrase doesn't stick. Recheck every 60 s; cheap
         # and dodges DST / time-change weirdness.
         self.set_interval(60.0, self._maybe_rotate_tagline)
         self._refresh_livestat()
         self.set_interval(2.0, self._refresh_livestat)
+
+    # ---------- active-tab gating (perf) --------------------------------
+
+    def _current_tab(self) -> str:
+        """id of the TabPane currently shown, or '' if unavailable."""
+        try:
+            return self.query_one(TabbedContent).active
+        except Exception:
+            return ""
+
+    def _gated(self, tab_id: str, fn):
+        """Wrap a periodic refresh so it only runs while its tab is active."""
+        def run() -> None:
+            if self._current_tab() == tab_id:
+                fn()
+        return run
+
+    def on_tabbed_content_tab_activated(self, event) -> None:
+        # The tab we just switched to may be up to one interval stale (its
+        # timer only fires while active), so refresh it once, now.
+        tab = self._current_tab()
+        try:
+            if tab == "home":
+                self._refresh_home()
+            elif tab == "power":
+                self._refresh_thermal()
+                self._refresh_power()
+            elif tab == "battery":
+                self._refresh_battery()
+            elif tab == "lightbar":
+                self._refresh_lightbar()
+            elif tab == "unified":
+                self._refresh_unified()
+        except Exception:
+            pass
 
     # ---------- central event dispatch
     #
