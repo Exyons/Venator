@@ -95,6 +95,7 @@ same keyboard MCU and WMI GUIDs are likely to work — reports and PRs to
 | PH16‑71  | Fedora 43 | `7.0.10-101.fc43.x86_64`  | 1.16 |
 | PH16‑71  | CachyOS   | `7.0.12-1-cachyos`        | 1.16 |
 | PH16-71  | CachyOS   | `7.1.2-3-cachyos`         | 1.16 |
+| PH16-71  | CachyOS   | `7.2.4-3-cachyos`         | 1.18 |
 
 ## Requirements
 
